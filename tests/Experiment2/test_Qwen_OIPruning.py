@@ -19,7 +19,7 @@ from Qwen2_5.utils_qwen import (
     BENCHMARKS,
 )
 from utils.oinfo import calculate_oinfo_gradient_distributed, calculate_oinfo_gradient
-from utils.distributed import is_main_process, init_distributed_mode, synchronize_between_processes
+from utils.distributed import is_main_process, init_distributed_mode, synchronize_between_processes, get_rank, get_world_size
 import transformers
 import datasets
 
@@ -27,6 +27,9 @@ import datasets
 def get_layerwise_activations(wrapper, max_samples=1000):
     if is_main_process():
         print("Obteniendo datos de calibración...")
+    
+    # Get all data - NO splitting across ranks to ensure correct covariance calculation
+    # Each GPU loads the same 1000 samples.
     input_ids, attention_mask = get_calibration_data(
         wrapper.tokenizer, 
         num_samples=max_samples
@@ -133,18 +136,18 @@ def prune_qwen_global():
         
         print("\n--- Evaluación Baseline ---")
     
-    # Only evaluate on main process to save time and avoid duplication
+    # Execute evaluation on ALL processes for distributed evaluation speedup
+    baseline_results = evaluate_with_harness(wrapper, batch_size=4)
+    
     if is_main_process():
-        baseline_results = evaluate_with_harness(wrapper, batch_size=4)
         print("Resultados baseline:")
         for benchmark, score in baseline_results.items():
             if score is not None:
                 print(f"  {benchmark}: {score:.4f}")
             else:
                 print(f"  {benchmark}: Error")
-    else:
-        baseline_results = {}
     
+    # Ensure all finished
     synchronize_between_processes()
     
     history = {
@@ -163,19 +166,23 @@ def prune_qwen_global():
             print(f"--- Pruning Iteration {iteration} ---")
             print(f"{'='*60}")
             
-            print("Recolectando activaciones por capa...")
+            print("Recolectando activaciones por capa (Distribuido)...")
+            print("Calculando O-Info (Paralelismo por Neuronas)...")
         
-        layer_activations = get_layerwise_activations(wrapper, max_samples=500)
+        # Load FULL data on all GPUs to ensure correct O-Info calculation
+        layer_activations = get_layerwise_activations(wrapper, max_samples=1000)
         
         layer_grads_list = []
         layer_stds_list = []
         total_prunable = 0
         
         # Only print tqdm on main process
-        iterator = tqdm(layer_activations, desc="Calculando O-Info") if is_main_process() else layer_activations
+        iterator = tqdm(layer_activations, desc="Procesando Capas") if is_main_process() else layer_activations
         
         for name, act_tensor in iterator:
             act_np = act_tensor.numpy()
+            
+            # 1. Compute local statistics (identical on all GPUs since data is identical)
             stds = np.std(act_np, axis=0)
             layer_stds_list.append(stds)
             valid_indices = np.where(stds > 1e-6)[0]
@@ -183,20 +190,25 @@ def prune_qwen_global():
             if is_main_process():
                 print(f"  {name}: {len(valid_indices)} neuronas activas de {act_np.shape[1]}")
             
+            grads = np.zeros(act_np.shape[1])
+            
             if len(valid_indices) > 0:
-                max_neurons = min(len(valid_indices), 8960)
-                if len(valid_indices) > max_neurons:
-                    selected = np.random.choice(valid_indices, max_neurons, replace=False)
-                    selected = np.sort(selected)
-                else:
-                    selected = valid_indices
+                # User requirement: NO random selection. Process ALL valid neurons.
+                # The distributed function splits the workload (indices) among GPUs,
+                # but each GPU holds the full matrix X_active to compute global entropy correctly.
+                selected = valid_indices
                 
                 X_active = act_np[:, selected]
-                grads_active, o_val = calculate_oinfo_gradient(X_active, k=3)
                 
-                grads = np.zeros(act_np.shape[1])
+                # USE DISTRIBUTED CALCULATION
+                # This function internally splits the columns (neurons) across GPUs
+                # and gathers the results so all ranks get the full gradient vector.
+                grads_active, o_val = calculate_oinfo_gradient_distributed(X_active, k=3)
+                
                 grads[selected] = grads_active
                 
+                # Unselected set is empty since we select all valid_indices
+                # Keeping this check just in case logic changes, but effectively it does nothing now.
                 unselected = np.setdiff1d(valid_indices, selected)
                 if len(unselected) > 0:
                     median_grad = np.median(grads_active)
@@ -204,12 +216,10 @@ def prune_qwen_global():
                 
                 if is_main_process():
                     print(f"    O-Info {name}: {o_val:.4f}")
-            else:
-                grads = np.zeros(act_np.shape[1])
-            
+
             layer_grads_list.append((name, grads))
             total_prunable += np.sum(grads > 0)
-        
+
         if is_main_process():
             visualize_epoch_oinfo(layer_grads_list, iteration, plot_dir)
         
@@ -250,12 +260,15 @@ def prune_qwen_global():
         
         if is_main_process():
             print("\nConstruyendo modelo prunado...")
+        
+        # All ranks must prune because they all have the model
         wrapper = wrapper.prune_mlp_neurons(layer_keep_masks)
         
         if is_main_process():
             print(f"Nuevos parámetros: {wrapper.count_parameters():,}")
         
             print("\nFine-tuning con LoRA (1 epoch)...")
+            
         wrapper = fine_tune_lora(
             wrapper,
             epochs=1,
@@ -267,16 +280,18 @@ def prune_qwen_global():
         
         if is_main_process():
             print("\nEvaluando en benchmarks...")
-            iter_results = evaluate_with_harness(wrapper, batch_size=4)
+            
+        # Execute evaluation on ALL processes
+        iter_results = evaluate_with_harness(wrapper, batch_size=4)
+        
+        if is_main_process():
             print(f"Resultados iteración {iteration}:")
             for benchmark, score in iter_results.items():
                 if score is not None:
                     print(f"  {benchmark}: {score:.4f}")
                 else:
                     print(f"  {benchmark}: Error")
-        else:
-            iter_results = {}
-            
+        
         synchronize_between_processes()
         
         history['iteration'].append(iteration)

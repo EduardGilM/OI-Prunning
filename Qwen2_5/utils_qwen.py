@@ -297,20 +297,20 @@ def evaluate_benchmarks(
 def evaluate_with_harness(
     wrapper,
     benchmarks: List[dict] = None,
-    batch_size: int = 4,
+    batch_size: int = 16,
 ) -> Dict[str, float]:
     try:
         from lm_eval import evaluator
         from lm_eval.models.huggingface import HFLM
     except ImportError:
-        print("lm-evaluation-harness not installed. Using subprocess fallback.")
-        temp_path = "./temp_model_eval"
-        wrapper.save(temp_path)
-        return evaluate_benchmarks(temp_path, benchmarks, batch_size)
+        print("lm-evaluation-harness not installed. Please install it with: pip install lm-eval")
+        return {}
     
     if benchmarks is None:
         benchmarks = BENCHMARKS
     
+    # Initialize HFLM with the distributed-ready model
+    # HFLM should detect the model device and use it.
     lm = HFLM(
         pretrained=wrapper.model,
         tokenizer=wrapper.tokenizer,
@@ -321,19 +321,32 @@ def evaluate_with_harness(
     num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
     
     results = {}
+    
+    # We iterate tasks because they might have different num_fewshot configurations
     for task in task_names:
         try:
+            # simple_evaluate handles distributed evaluation if accelerate is set up
             eval_results = evaluator.simple_evaluate(
                 model=lm,
                 tasks=[task],
                 num_fewshot=num_fewshot_map[task],
+                batch_size=batch_size,
             )
             
-            task_results = eval_results.get("results", {}).get(task, {})
-            acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
-            results[task] = acc
+            # Extract results - simple_evaluate returns a dict with 'results'
+            # In distributed mode, typically all ranks return the result or rank 0 does.
+            # We safely get it.
+            if eval_results and "results" in eval_results:
+                 task_results = eval_results["results"].get(task, {})
+                 # Try different metric keys common in lm_eval
+                 acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
+                 results[task] = acc
+            else:
+                 results[task] = None
             
         except Exception as e:
+            # Use print only on rank 0 if possible, or catch generally
+            # But here we just print as this function is called on all ranks now
             print(f"Error evaluating {task}: {e}")
             results[task] = None
     

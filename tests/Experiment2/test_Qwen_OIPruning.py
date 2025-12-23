@@ -132,7 +132,7 @@ def prune_qwen_global():
     if is_main_process():
         print(f"Parámetros iniciales: {wrapper.count_parameters():,}")
         print(f"Número de capas: {wrapper.num_layers}")
-        print(f"Dimensiones MLP: {wrapper.get_mlp_dimensions()[:3]}... (mostrando primeras 3)")
+        print(f"Dimensiones MLP: {wrapper.get_mlp_dimensions()}")
         
         print("\n--- Evaluación Baseline ---")
     

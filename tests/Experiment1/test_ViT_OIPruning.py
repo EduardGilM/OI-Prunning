@@ -29,7 +29,7 @@ from ViT_MNIST.utils_vit import (
     ACTIVATION,
     IN_CHANNELS,
 )
-from utils.oinfo import calculate_oinfo_gradient
+from utils.oinfo import calculate_oinfo_gradient_distributed, calculate_oinfo_gradient
 
 
 def get_layerwise_activations(model, val_loader, device, max_samples=1000):

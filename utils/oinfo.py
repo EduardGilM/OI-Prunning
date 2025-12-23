@@ -3,6 +3,8 @@ import torch
 from sklearn.neighbors import NearestNeighbors
 from scipy.special import digamma, gamma
 from tqdm.auto import tqdm
+import torch.distributed as dist
+from typing import Tuple, Optional
 
 def entropy_knn(X, k=3):
     """
@@ -88,9 +90,9 @@ def calculate_oinfo_gradient(X, k=3):
     Calculates the 'local gradient' of O-information for each neuron.
     Defined as Delta Omega_j = Omega(X) - Omega(X_{-j}).
     Positive value means the neuron contributes to redundancy.
+    
+    Supports distributed computation across multiple GPUs (by neurons, not by data).
     """
-    # Mantener compatibilidad: aceptar numpy y devolver numpy
-    # Para acelerar, se hace todo en torch y en GPU si está disponible.
     if not isinstance(X, torch.Tensor):
         X_t = torch.tensor(X, dtype=torch.float32)
     else:
@@ -105,11 +107,9 @@ def calculate_oinfo_gradient(X, k=3):
         """
         N, d = X_t.shape
         X_noise = X_t + eps * torch.randn_like(X_t)
-        # Distancias NxN
         dist = torch.cdist(X_noise, X_noise, p=2)
-        # Tomar k+1 vecinos (incluye self con dist=0)
         knn_dist, _ = torch.topk(dist, k + 1, dim=1, largest=False)
-        rho = knn_dist[:, k] + eps  # distancia al k-ésimo vecino
+        rho = knn_dist[:, k] + eps
 
         log_cd = (d / 2) * torch.log(torch.tensor(np.pi, device=device)) - torch.lgamma(torch.tensor(d / 2 + 1.0, device=device))
         H = (
@@ -136,8 +136,9 @@ def calculate_oinfo_gradient(X, k=3):
     omega_X = torch_calculate_oinfo(X_t, k)
     grads = []
     d = X_t.shape[1]
-    # Barra de progreso por neurona/capa (cada j quita una dimensión)
-    for j in tqdm(range(d), desc="OI grad por capa", leave=False):
+    
+    desc = "OI grad por capa"
+    for j in tqdm(range(d), desc=desc, leave=False):
         mask = torch.ones(d, dtype=torch.bool, device=device)
         mask[j] = False
         omega_minus_j = torch_calculate_oinfo(X_t[:, mask], k)
@@ -145,3 +146,147 @@ def calculate_oinfo_gradient(X, k=3):
 
     grads_np = np.array(grads, dtype=np.float64)
     return grads_np, omega_X.item()
+
+
+def calculate_oinfo_gradient_distributed(X, k=3) -> Tuple[np.ndarray, float]:
+    """
+    Distributed OInfo calculation across multiple GPUs.
+    Distributes neuron dimension across GPUs, not the batch dimension.
+    
+    Each GPU computes OInfo gradient for a subset of neurons independently.
+    Activations X are shared across all GPUs (broadcast).
+    
+    Parameters:
+    -----------
+    X : np.ndarray or torch.Tensor
+        Shape (N, d) where N=samples, d=hidden_dim (e.g., 8960 for Qwen)
+    k : int
+        Number of neighbors for KNN entropy estimation
+    
+    Returns:
+    --------
+    grads : np.ndarray
+        Shape (d,) - OInfo gradient for each neuron
+    omega_X : float
+        Global OInfo value
+    
+    Example:
+    --------
+    # Qwen with 8960 hidden dimensions across 4 GPUs
+    activations.shape = (1000, 8960)
+    grads, omega = calculate_oinfo_gradient_distributed(activations)
+    # GPU0: computes neurons 0-2239
+    # GPU1: computes neurons 2240-4479
+    # GPU2: computes neurons 4480-6719
+    # GPU3: computes neurons 6720-8959
+    # Results gathered back to GPU0
+    """
+    
+    is_distributed = dist.is_available() and dist.is_initialized()
+    
+    if not is_distributed:
+        return calculate_oinfo_gradient(X, k)
+    
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{rank}")
+    
+    if not isinstance(X, torch.Tensor):
+        X_t = torch.tensor(X, dtype=torch.float32)
+    else:
+        X_t = X.float()
+    
+    X_t = X_t.to(device)
+    N, d = X_t.shape
+    
+    def torch_entropy_knn(X_t, k=3, eps=1e-12):
+        N, d = X_t.shape
+        X_noise = X_t + eps * torch.randn_like(X_t)
+        dist_mat = torch.cdist(X_noise, X_noise, p=2)
+        knn_dist, _ = torch.topk(dist_mat, k + 1, dim=1, largest=False)
+        rho = knn_dist[:, k] + eps
+
+        log_cd = (d / 2) * torch.log(torch.tensor(np.pi, device=device)) - torch.lgamma(torch.tensor(d / 2 + 1.0, device=device))
+        H = (
+            torch.digamma(torch.tensor(float(N), device=device))
+            - torch.digamma(torch.tensor(float(k), device=device))
+            + log_cd
+            + (d / N) * torch.sum(torch.log(rho))
+        )
+        return H
+
+    def torch_calculate_oinfo(X_t, k=3):
+        N, d = X_t.shape
+        H_X = torch_entropy_knn(X_t, k)
+        sum_term = 0.0
+        for i in range(d):
+            H_Xi = torch_entropy_knn(X_t[:, i : i + 1], k)
+            mask = torch.ones(d, dtype=torch.bool, device=device)
+            mask[i] = False
+            H_X_minus_i = torch_entropy_knn(X_t[:, mask], k)
+            sum_term = sum_term + (H_Xi - H_X_minus_i)
+        oinfo = (d - 2) * H_X + sum_term
+        return oinfo
+
+    omega_X = torch_calculate_oinfo(X_t, k)
+    
+    neurons_per_gpu = (d + world_size - 1) // world_size
+    start_idx = rank * neurons_per_gpu
+    end_idx = min((rank + 1) * neurons_per_gpu, d)
+    local_neurons = range(start_idx, end_idx)
+    
+    local_grads = []
+    desc = f"OI grad GPU{rank} [{start_idx}-{end_idx}]"
+    for j in tqdm(local_neurons, desc=desc, leave=False):
+        mask = torch.ones(d, dtype=torch.bool, device=device)
+        mask[j] = False
+        omega_minus_j = torch_calculate_oinfo(X_t[:, mask], k)
+        local_grads.append((omega_X - omega_minus_j).item())
+    
+    all_grads = [None] * world_size if rank == 0 else None
+    dist.gather_object(local_grads, all_grads, dst=0)
+    
+    if rank == 0:
+        grads_list = []
+        for gpu_grads in all_grads:
+            grads_list.extend(gpu_grads)
+        grads_np = np.array(grads_list[:d], dtype=np.float64)
+    else:
+        grads_np = np.zeros(d, dtype=np.float64)
+    
+    dist.broadcast_object_list([grads_np], src=0)
+    
+    return grads_np, omega_X.item()
+
+
+def calculate_oinfo_gradient_auto(X, k=3) -> Tuple[np.ndarray, float]:
+    """
+    Automatically selects between standard and distributed OInfo calculation.
+    
+    Uses distributed computation if:
+    - Multiple GPUs are available and initialized
+    - Neuron dimension is large (> 1000)
+    
+    Otherwise falls back to standard single-GPU computation.
+    
+    Parameters:
+    -----------
+    X : np.ndarray or torch.Tensor
+        Shape (N, d) where N=samples, d=hidden_dim
+    k : int
+        Number of neighbors for KNN entropy estimation
+    
+    Returns:
+    --------
+    grads : np.ndarray
+        Shape (d,) - OInfo gradient for each neuron
+    omega_X : float
+        Global OInfo value
+    """
+    is_distributed = dist.is_available() and dist.is_initialized()
+    num_neurons = X.shape[1] if isinstance(X, np.ndarray) else X.shape[1]
+    
+    if is_distributed and num_neurons > 1000:
+        return calculate_oinfo_gradient_distributed(X, k)
+    else:
+        return calculate_oinfo_gradient(X, k)

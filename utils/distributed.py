@@ -174,4 +174,6 @@ def print_once(msg: str, rank: int = 0) -> None:
 
 def synchronize_between_processes() -> None:
     if is_distributed():
-        dist.barrier()
+        # Specify device_ids to avoid warnings and potential guessing issues
+        local_rank = get_local_rank()
+        dist.barrier(device_ids=[local_rank])

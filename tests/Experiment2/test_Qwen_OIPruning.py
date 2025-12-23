@@ -19,7 +19,9 @@ from Qwen2_5.utils_qwen import (
     BENCHMARKS,
 )
 from utils.oinfo import calculate_oinfo_gradient_distributed, calculate_oinfo_gradient
-from utils.distributed import is_main_process
+from utils.distributed import is_main_process, init_distributed_mode, synchronize_between_processes
+import transformers
+import datasets
 
 
 def get_layerwise_activations(wrapper, max_samples=1000):
@@ -86,6 +88,14 @@ def visualize_epoch_oinfo(layer_grads_list, iteration, output_dir):
 
 
 def prune_qwen_global():
+    # Initialize distributed mode first
+    init_distributed_mode()
+    
+    # Suppress verbose logs
+    if not is_main_process():
+        transformers.logging.set_verbosity_error()
+        datasets.logging.set_verbosity_error()
+    
     if is_main_process():
         print("=" * 60)
         print("EXPERIMENT: Qwen2.5-1.5B MLP PRUNING with O-Information")
@@ -123,15 +133,19 @@ def prune_qwen_global():
         
         print("\n--- Evaluación Baseline ---")
     
-    baseline_results = evaluate_with_harness(wrapper, batch_size=4)
-    
+    # Only evaluate on main process to save time and avoid duplication
     if is_main_process():
+        baseline_results = evaluate_with_harness(wrapper, batch_size=4)
         print("Resultados baseline:")
         for benchmark, score in baseline_results.items():
             if score is not None:
                 print(f"  {benchmark}: {score:.4f}")
             else:
                 print(f"  {benchmark}: Error")
+    else:
+        baseline_results = {}
+    
+    synchronize_between_processes()
     
     history = {
         'iteration': [0],
@@ -253,20 +267,23 @@ def prune_qwen_global():
         
         if is_main_process():
             print("\nEvaluando en benchmarks...")
-        iter_results = evaluate_with_harness(wrapper, batch_size=4)
-        
-        if is_main_process():
+            iter_results = evaluate_with_harness(wrapper, batch_size=4)
             print(f"Resultados iteración {iteration}:")
             for benchmark, score in iter_results.items():
                 if score is not None:
                     print(f"  {benchmark}: {score:.4f}")
                 else:
                     print(f"  {benchmark}: Error")
+        else:
+            iter_results = {}
             
-            history['iteration'].append(iteration)
-            history['params'].append(wrapper.count_parameters())
-            history['benchmarks'].append(iter_results)
-            
+        synchronize_between_processes()
+        
+        history['iteration'].append(iteration)
+        history['params'].append(wrapper.count_parameters())
+        history['benchmarks'].append(iter_results)
+        
+        if is_main_process():
             wrapper.save(str(pruned_path))
     
     if is_main_process():

@@ -305,49 +305,61 @@ def evaluate_with_harness(
     except ImportError:
         print("lm-evaluation-harness not installed. Please install it with: pip install lm-eval")
         return {}
+        
+    import shutil
     
     if benchmarks is None:
         benchmarks = BENCHMARKS
     
-    # Initialize HFLM with the distributed-ready model
-    # HFLM should detect the model device and use it.
-    lm = HFLM(
-        pretrained=wrapper.model,
-        tokenizer=wrapper.tokenizer,
-        batch_size=batch_size,
-    )
+    # Save model to temp path to allow lm_eval to handle loading/sharding efficiently
+    # This avoids DDP sync issues when passing in-memory model directly
+    temp_path = "tmp_eval_model"
     
-    task_names = [b["name"] for b in benchmarks]
-    num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
+    if is_main_process():
+        wrapper.save(temp_path)
     
-    results = {}
+    synchronize_between_processes()
     
-    # We iterate tasks because they might have different num_fewshot configurations
-    for task in task_names:
-        try:
-            # simple_evaluate handles distributed evaluation if accelerate is set up
-            eval_results = evaluator.simple_evaluate(
-                model=lm,
-                tasks=[task],
-                num_fewshot=num_fewshot_map[task],
-                batch_size=batch_size,
-            )
-            
-            # Extract results - simple_evaluate returns a dict with 'results'
-            # In distributed mode, typically all ranks return the result or rank 0 does.
-            # We safely get it.
-            if eval_results and "results" in eval_results:
-                 task_results = eval_results["results"].get(task, {})
-                 # Try different metric keys common in lm_eval
-                 acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
-                 results[task] = acc
-            else:
-                 results[task] = None
-            
-        except Exception as e:
-            # Use print only on rank 0 if possible, or catch generally
-            # But here we just print as this function is called on all ranks now
-            print(f"Error evaluating {task}: {e}")
-            results[task] = None
+    try:
+        # Initialize HFLM with the path - let lm_eval handle loading and DDP setup
+        lm = HFLM(
+            pretrained=temp_path,
+            batch_size=batch_size,
+            trust_remote_code=True,
+        )
+        
+        task_names = [b["name"] for b in benchmarks]
+        num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
+        
+        results = {}
+        
+        for task in task_names:
+            try:
+                eval_results = evaluator.simple_evaluate(
+                    model=lm,
+                    tasks=[task],
+                    num_fewshot=num_fewshot_map[task],
+                    batch_size=batch_size,
+                )
+                
+                if eval_results and "results" in eval_results:
+                     task_results = eval_results["results"].get(task, {})
+                     acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
+                     results[task] = acc
+                else:
+                     results[task] = None
+                
+            except Exception as e:
+                print(f"Error evaluating {task}: {e}")
+                results[task] = None
+                
+    finally:
+        # Cleanup
+        synchronize_between_processes()
+        if is_main_process() and os.path.exists(temp_path):
+            try:
+                shutil.rmtree(temp_path)
+            except:
+                pass
     
     return results

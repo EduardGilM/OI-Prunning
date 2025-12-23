@@ -14,7 +14,8 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.distributed import (
     get_device, get_num_gpus, is_main_process, init_distributed_mode,
-    wrap_model_distributed, unwrap_model, print_once, get_rank, get_world_size
+    wrap_model_distributed, unwrap_model, print_once, get_rank, get_world_size,
+    synchronize_between_processes
 )
 
 DOLLY_DATASET = "databricks/databricks-dolly-15k"

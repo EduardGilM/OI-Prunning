@@ -35,7 +35,7 @@ class QwenWrapper:
                 trust_remote_code=True,
             )
         
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, fix_mistral_regex=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             
@@ -152,7 +152,7 @@ class QwenWrapper:
             device_map="auto",
             trust_remote_code=True,
         )
-        wrapper.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+        wrapper.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, fix_mistral_regex=True)
         if wrapper.tokenizer.pad_token is None:
             wrapper.tokenizer.pad_token = wrapper.tokenizer.eos_token
         wrapper.config = wrapper.model.config

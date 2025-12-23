@@ -327,6 +327,7 @@ def evaluate_with_harness(
             pretrained=temp_path,
             batch_size=batch_size,
             trust_remote_code=True,
+            fix_mistral_regex=True,
         )
         
         task_names = [b["name"] for b in benchmarks]

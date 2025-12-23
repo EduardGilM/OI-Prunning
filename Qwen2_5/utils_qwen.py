@@ -236,8 +236,8 @@ def evaluate_benchmarks(
         name = benchmark["name"]
         num_fewshot = benchmark.get("num_fewshot", 0)
         
-        cmd = [
-            "lm_eval",
+        base_cmd = ["lm_eval"]
+        args = [
             "--model", "hf",
             "--model_args", f"pretrained={model_path},trust_remote_code=True",
             "--tasks", name,
@@ -246,9 +246,16 @@ def evaluate_benchmarks(
             "--output_path", output_path or "eval_results",
         ]
         
+        cmd = base_cmd + args
+        
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-            
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            except FileNotFoundError:
+                # Try python -m lm_eval
+                cmd = [sys.executable, "-m", "lm_eval"] + args
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+
             if result.returncode == 0:
                 # Parse del output para obtener accuracy
                 output_lines = result.stdout.split("\n")
@@ -270,11 +277,16 @@ def evaluate_benchmarks(
                     print(f"Could not parse results for {name}")
             else:
                 print(f"Error evaluating {name}: {result.stderr}")
+                if "No such file or directory" in str(result.stderr) or result.returncode == 127:
+                     print("Make sure lm-evaluation-harness is installed: pip install lm-evaluation-harness")
                 results[name] = None
                 
         except subprocess.TimeoutExpired:
             print(f"Timeout evaluating {name}")
             results[name] = None
+        except FileNotFoundError:
+             print(f"Command 'lm_eval' not found. Please install it: pip install lm-evaluation-harness")
+             results[name] = None
         except Exception as e:
             print(f"Exception evaluating {name}: {e}")
             results[name] = None

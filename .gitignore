@@ -1,2 +1,10 @@
 .venv
 .env
+.pytest_cache
+models
+tests/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+data
+utils/__pycache__/

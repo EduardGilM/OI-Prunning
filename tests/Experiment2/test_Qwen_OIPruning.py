@@ -125,7 +125,7 @@ def prune_qwen_global():
         if is_main_process():
             print("Cargando modelo base desde HuggingFace...")
         wrapper = QwenWrapper(
-            model_name="Qwen/Qwen2.5-0.5B-Instruct",
+            model_name="HuggingFaceTB/SmolLM2-360M",
             load_in_4bit=False,
         )
     

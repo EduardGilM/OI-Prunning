@@ -113,6 +113,8 @@ class QwenWrapper:
             old_up = layer.mlp.up_proj
             old_down = layer.mlp.down_proj
             
+            layer_device = old_gate.weight.device
+            
             new_gate = nn.Linear(old_gate.in_features, new_dim, bias=old_gate.bias is not None)
             new_gate.weight.data = old_gate.weight.data[indices, :].clone()
             if old_gate.bias is not None:
@@ -128,9 +130,9 @@ class QwenWrapper:
             if old_down.bias is not None:
                 new_down.bias.data = old_down.bias.data.clone()
             
-            layer.mlp.gate_proj = new_gate.to(self.device).half()
-            layer.mlp.up_proj = new_up.to(self.device).half()
-            layer.mlp.down_proj = new_down.to(self.device).half()
+            layer.mlp.gate_proj = new_gate.to(layer_device).half()
+            layer.mlp.up_proj = new_up.to(layer_device).half()
+            layer.mlp.down_proj = new_down.to(layer_device).half()
         
         new_wrapper.intermediate_size = new_wrapper.get_mlp_dimensions()
         return new_wrapper

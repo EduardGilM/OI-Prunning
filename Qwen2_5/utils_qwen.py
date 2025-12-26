@@ -308,59 +308,75 @@ def evaluate_with_harness(
         return {}
         
     import shutil
+    import pickle
     
     if benchmarks is None:
         benchmarks = BENCHMARKS
     
-    # Save model to temp path to allow lm_eval to handle loading/sharding efficiently
-    # This avoids DDP sync issues when passing in-memory model directly
     temp_path = "tmp_eval_model"
+    results_path = "tmp_eval_results.pkl"
     
     if is_main_process():
         wrapper.save(temp_path)
     
     synchronize_between_processes()
     
-    try:
-        # Initialize HFLM with the path - let lm_eval handle loading and DDP setup
-        lm = HFLM(
-            pretrained=temp_path,
-            batch_size=batch_size,
-            trust_remote_code=True,
-        )
-        
-        task_names = [b["name"] for b in benchmarks]
-        num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
-        
-        results = {}
-        
-        for task in task_names:
-            try:
-                eval_results = evaluator.simple_evaluate(
-                    model=lm,
-                    tasks=[task],
-                    num_fewshot=num_fewshot_map[task],
-                    batch_size=batch_size,
-                )
-                
-                if eval_results and "results" in eval_results:
-                     task_results = eval_results["results"].get(task, {})
-                     acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
-                     results[task] = acc
-                else:
-                     results[task] = None
-                
-            except Exception as e:
-                print(f"Error evaluating {task}: {e}")
-                results[task] = None
-                
-    finally:
-        # Cleanup
-        synchronize_between_processes()
-        if is_main_process() and os.path.exists(temp_path):
-            try:
-                shutil.rmtree(temp_path)
-            except:
-                pass
+    results = {}
+    
+    if is_main_process():
+        try:
+            lm = HFLM(
+                pretrained=temp_path,
+                batch_size=batch_size,
+                trust_remote_code=True,
+            )
+            
+            task_names = [b["name"] for b in benchmarks]
+            num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
+            
+            for task in task_names:
+                try:
+                    eval_results = evaluator.simple_evaluate(
+                        model=lm,
+                        tasks=[task],
+                        num_fewshot=num_fewshot_map[task],
+                        batch_size=batch_size,
+                    )
+                    
+                    if eval_results and "results" in eval_results:
+                        task_results = eval_results["results"].get(task, {})
+                        acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
+                        results[task] = acc
+                    else:
+                        results[task] = None
+                    
+                except Exception as e:
+                    print(f"Error evaluating {task}: {e}")
+                    results[task] = None
+            
+            with open(results_path, "wb") as f:
+                pickle.dump(results, f)
+                    
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    shutil.rmtree(temp_path)
+                except:
+                    pass
+    
+    synchronize_between_processes()
+    
+    if not is_main_process():
+        if os.path.exists(results_path):
+            with open(results_path, "rb") as f:
+                results = pickle.load(f)
+    
+    synchronize_between_processes()
+    
+    if is_main_process() and os.path.exists(results_path):
+        try:
+            os.remove(results_path)
+        except:
+            pass
     
     return results

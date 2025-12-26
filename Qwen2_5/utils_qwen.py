@@ -311,6 +311,8 @@ def evaluate_with_harness(
     import pickle
     import time
     
+    os.environ["PYTHONUNBUFFERED"] = "1"
+    
     if benchmarks is None:
         benchmarks = BENCHMARKS
     
@@ -331,8 +333,7 @@ def evaluate_with_harness(
     
     if is_main_process():
         try:
-            print(f"Cargando modelo para evaluacion desde {temp_path}...")
-            sys.stdout.flush()
+            print(f"Cargando modelo para evaluacion desde {temp_path}...", flush=True)
             
             lm = HFLM(
                 pretrained=temp_path,
@@ -345,8 +346,7 @@ def evaluate_with_harness(
             
             for task in task_names:
                 try:
-                    print(f"Evaluando benchmark: {task} (num_fewshot={num_fewshot_map[task]})...")
-                    sys.stdout.flush()
+                    print(f"Evaluando benchmark: {task} (num_fewshot={num_fewshot_map[task]})...", flush=True)
                     
                     eval_results = evaluator.simple_evaluate(
                         model=lm,
@@ -359,12 +359,10 @@ def evaluate_with_harness(
                         task_results = eval_results["results"].get(task, {})
                         acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
                         results[task] = acc
-                        print(f"  {task}: {acc}")
-                        sys.stdout.flush()
+                        print(f"  {task}: {acc}", flush=True)
                     else:
                         results[task] = None
-                        print(f"  {task}: No se pudo obtener resultado")
-                        sys.stdout.flush()
+                        print(f"  {task}: No se pudo obtener resultado", flush=True)
                     
                 except Exception as e:
                     print(f"Error evaluating {task}: {e}")

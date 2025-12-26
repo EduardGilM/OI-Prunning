@@ -331,6 +331,9 @@ def evaluate_with_harness(
     
     if is_main_process():
         try:
+            print(f"Cargando modelo para evaluacion desde {temp_path}...")
+            sys.stdout.flush()
+            
             lm = HFLM(
                 pretrained=temp_path,
                 batch_size=batch_size,
@@ -342,6 +345,9 @@ def evaluate_with_harness(
             
             for task in task_names:
                 try:
+                    print(f"Evaluando benchmark: {task} (num_fewshot={num_fewshot_map[task]})...")
+                    sys.stdout.flush()
+                    
                     eval_results = evaluator.simple_evaluate(
                         model=lm,
                         tasks=[task],
@@ -353,8 +359,12 @@ def evaluate_with_harness(
                         task_results = eval_results["results"].get(task, {})
                         acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
                         results[task] = acc
+                        print(f"  {task}: {acc}")
+                        sys.stdout.flush()
                     else:
                         results[task] = None
+                        print(f"  {task}: No se pudo obtener resultado")
+                        sys.stdout.flush()
                     
                 except Exception as e:
                     print(f"Error evaluating {task}: {e}")

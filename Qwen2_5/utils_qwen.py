@@ -316,15 +316,20 @@ def evaluate_with_harness(
     if benchmarks is None:
         benchmarks = BENCHMARKS
     
-    temp_path = "tmp_eval_model"
-    results_path = "tmp_eval_results.pkl"
-    done_flag_path = "tmp_eval_done.flag"
+    base_tmp_dir = Path(__file__).parent.parent / "tmp_eval"
+    base_tmp_dir.mkdir(exist_ok=True)
+    
+    temp_path = str(base_tmp_dir / "model")
+    results_path = str(base_tmp_dir / "results.pkl")
+    done_flag_path = str(base_tmp_dir / "done.flag")
     
     if is_main_process():
         if os.path.exists(done_flag_path):
             os.remove(done_flag_path)
         if os.path.exists(results_path):
             os.remove(results_path)
+        if os.path.exists(temp_path):
+            shutil.rmtree(temp_path)
         wrapper.save(temp_path)
     
     synchronize_between_processes()
@@ -355,17 +360,22 @@ def evaluate_with_harness(
                         batch_size=batch_size,
                     )
                     
+                    print(f"Evaluacion de {task} completada, procesando resultados...", flush=True)
+                    
                     if eval_results and "results" in eval_results:
                         task_results = eval_results["results"].get(task, {})
+                        print(f"  Claves disponibles: {list(task_results.keys())}", flush=True)
                         acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
                         results[task] = acc
                         print(f"  {task}: {acc}", flush=True)
                     else:
                         results[task] = None
-                        print(f"  {task}: No se pudo obtener resultado", flush=True)
+                        print(f"  {task}: No se pudo obtener resultado (eval_results={eval_results})", flush=True)
                     
                 except Exception as e:
-                    print(f"Error evaluating {task}: {e}")
+                    import traceback
+                    print(f"Error evaluating {task}: {e}", flush=True)
+                    traceback.print_exc()
                     results[task] = None
             
             with open(results_path, "wb") as f:

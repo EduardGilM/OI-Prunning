@@ -308,121 +308,65 @@ def evaluate_with_harness(
         return {}
         
     import shutil
-    import pickle
-    import time
-    
-    os.environ["PYTHONUNBUFFERED"] = "1"
     
     if benchmarks is None:
         benchmarks = BENCHMARKS
     
-    base_tmp_dir = Path(__file__).parent.parent / "tmp_eval"
-    base_tmp_dir.mkdir(exist_ok=True)
-    
-    temp_path = str(base_tmp_dir / "model")
-    results_path = str(base_tmp_dir / "results.pkl")
-    done_flag_path = str(base_tmp_dir / "done.flag")
+    temp_path = "tmp_eval_model"
     
     if is_main_process():
-        if os.path.exists(done_flag_path):
-            os.remove(done_flag_path)
-        if os.path.exists(results_path):
-            os.remove(results_path)
         if os.path.exists(temp_path):
             shutil.rmtree(temp_path)
         wrapper.save(temp_path)
     
     synchronize_between_processes()
     
-    results = {}
-    
-    if is_main_process():
-        try:
+    try:
+        if is_main_process():
             print(f"Cargando modelo para evaluacion desde {temp_path}...", flush=True)
-            
-            old_world_size = os.environ.get("WORLD_SIZE")
-            old_rank = os.environ.get("RANK")
-            old_local_rank = os.environ.get("LOCAL_RANK")
-            os.environ["WORLD_SIZE"] = "1"
-            os.environ["RANK"] = "0"
-            os.environ["LOCAL_RANK"] = "0"
-            
-            lm = HFLM(
-                pretrained=temp_path,
-                batch_size=batch_size,
-                trust_remote_code=True,
-            )
-            
-            task_names = [b["name"] for b in benchmarks]
-            num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
-            
-            for task in task_names:
-                try:
-                    print(f"Evaluando benchmark: {task} (num_fewshot={num_fewshot_map[task]})...", flush=True)
-                    
-                    eval_results = evaluator.simple_evaluate(
-                        model=lm,
-                        tasks=[task],
-                        num_fewshot=num_fewshot_map[task],
-                        batch_size=batch_size,
-                    )
-                    
-                    print(f"Evaluacion de {task} completada, procesando resultados...", flush=True)
-                    
-                    if eval_results and "results" in eval_results:
-                        task_results = eval_results["results"].get(task, {})
-                        print(f"  Claves disponibles: {list(task_results.keys())}", flush=True)
-                        acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
-                        results[task] = acc
-                        print(f"  {task}: {acc}", flush=True)
-                    else:
-                        results[task] = None
-                        print(f"  {task}: No se pudo obtener resultado (eval_results={eval_results})", flush=True)
-                    
-                except Exception as e:
-                    import traceback
-                    print(f"Error evaluating {task}: {e}", flush=True)
-                    traceback.print_exc()
-                    results[task] = None
-            
-            with open(results_path, "wb") as f:
-                pickle.dump(results, f)
-            
-            with open(done_flag_path, "w") as f:
-                f.write("done")
-            
-            if old_world_size:
-                os.environ["WORLD_SIZE"] = old_world_size
-            if old_rank:
-                os.environ["RANK"] = old_rank
-            if old_local_rank:
-                os.environ["LOCAL_RANK"] = old_local_rank
-                    
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    shutil.rmtree(temp_path)
-                except:
-                    pass
-    else:
-        while not os.path.exists(done_flag_path):
-            time.sleep(5)
         
-        if os.path.exists(results_path):
-            with open(results_path, "rb") as f:
-                results = pickle.load(f)
-    
-    synchronize_between_processes()
-    
-    if is_main_process():
-        if os.path.exists(results_path):
+        lm = HFLM(
+            pretrained=temp_path,
+            batch_size=batch_size,
+            trust_remote_code=True,
+        )
+        
+        task_names = [b["name"] for b in benchmarks]
+        num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
+        
+        results = {}
+        
+        for task in task_names:
             try:
-                os.remove(results_path)
-            except:
-                pass
-        if os.path.exists(done_flag_path):
+                if is_main_process():
+                    print(f"Evaluando benchmark: {task} (num_fewshot={num_fewshot_map[task]})...", flush=True)
+                
+                eval_results = evaluator.simple_evaluate(
+                    model=lm,
+                    tasks=[task],
+                    num_fewshot=num_fewshot_map[task],
+                    batch_size=batch_size,
+                )
+                
+                if eval_results and "results" in eval_results:
+                    task_results = eval_results["results"].get(task, {})
+                    acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
+                    results[task] = acc
+                    if is_main_process():
+                        print(f"  {task}: {acc}", flush=True)
+                else:
+                    results[task] = None
+                
+            except Exception as e:
+                if is_main_process():
+                    print(f"Error evaluating {task}: {e}", flush=True)
+                results[task] = None
+                
+    finally:
+        synchronize_between_processes()
+        if is_main_process() and os.path.exists(temp_path):
             try:
-                os.remove(done_flag_path)
+                shutil.rmtree(temp_path)
             except:
                 pass
     

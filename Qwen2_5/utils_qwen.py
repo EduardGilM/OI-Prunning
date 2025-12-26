@@ -340,6 +340,13 @@ def evaluate_with_harness(
         try:
             print(f"Cargando modelo para evaluacion desde {temp_path}...", flush=True)
             
+            old_world_size = os.environ.get("WORLD_SIZE")
+            old_rank = os.environ.get("RANK")
+            old_local_rank = os.environ.get("LOCAL_RANK")
+            os.environ["WORLD_SIZE"] = "1"
+            os.environ["RANK"] = "0"
+            os.environ["LOCAL_RANK"] = "0"
+            
             lm = HFLM(
                 pretrained=temp_path,
                 batch_size=batch_size,
@@ -383,6 +390,13 @@ def evaluate_with_harness(
             
             with open(done_flag_path, "w") as f:
                 f.write("done")
+            
+            if old_world_size:
+                os.environ["WORLD_SIZE"] = old_world_size
+            if old_rank:
+                os.environ["RANK"] = old_rank
+            if old_local_rank:
+                os.environ["LOCAL_RANK"] = old_local_rank
                     
         finally:
             if os.path.exists(temp_path):

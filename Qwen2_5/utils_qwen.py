@@ -309,14 +309,20 @@ def evaluate_with_harness(
         
     import shutil
     import pickle
+    import time
     
     if benchmarks is None:
         benchmarks = BENCHMARKS
     
     temp_path = "tmp_eval_model"
     results_path = "tmp_eval_results.pkl"
+    done_flag_path = "tmp_eval_done.flag"
     
     if is_main_process():
+        if os.path.exists(done_flag_path):
+            os.remove(done_flag_path)
+        if os.path.exists(results_path):
+            os.remove(results_path)
         wrapper.save(temp_path)
     
     synchronize_between_processes()
@@ -356,6 +362,9 @@ def evaluate_with_harness(
             
             with open(results_path, "wb") as f:
                 pickle.dump(results, f)
+            
+            with open(done_flag_path, "w") as f:
+                f.write("done")
                     
         finally:
             if os.path.exists(temp_path):
@@ -363,20 +372,26 @@ def evaluate_with_harness(
                     shutil.rmtree(temp_path)
                 except:
                     pass
-    
-    synchronize_between_processes()
-    
-    if not is_main_process():
+    else:
+        while not os.path.exists(done_flag_path):
+            time.sleep(5)
+        
         if os.path.exists(results_path):
             with open(results_path, "rb") as f:
                 results = pickle.load(f)
     
     synchronize_between_processes()
     
-    if is_main_process() and os.path.exists(results_path):
-        try:
-            os.remove(results_path)
-        except:
-            pass
+    if is_main_process():
+        if os.path.exists(results_path):
+            try:
+                os.remove(results_path)
+            except:
+                pass
+        if os.path.exists(done_flag_path):
+            try:
+                os.remove(done_flag_path)
+            except:
+                pass
     
     return results

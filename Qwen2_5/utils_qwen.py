@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from transformers import get_linear_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
@@ -15,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.distributed import (
     get_device, get_num_gpus, is_main_process, init_distributed_mode,
     wrap_model_distributed, unwrap_model, print_once, get_rank, get_world_size,
-    synchronize_between_processes
+    synchronize_between_processes, is_distributed
 )
 
 DOLLY_DATASET = "databricks/databricks-dolly-15k"
@@ -300,74 +301,107 @@ def evaluate_with_harness(
     benchmarks: List[dict] = None,
     batch_size: int = 16,
 ) -> Dict[str, float]:
-    try:
-        from lm_eval import evaluator
-        from lm_eval.models.huggingface import HFLM
-    except ImportError:
-        print("lm-evaluation-harness not installed. Please install it with: pip install lm-eval")
-        return {}
-        
+    """
+    Evaluate model on benchmarks using lm-evaluation-harness.
+    
+    NOTE: This runs ONLY on the main process (rank 0) to avoid NCCL deadlocks.
+    The lm_eval library doesn't support multi-process distributed evaluation
+    within an existing process group, so we run evaluation on rank 0 only
+    while other ranks wait at the barrier.
+    """
     import shutil
     
     if benchmarks is None:
         benchmarks = BENCHMARKS
     
     temp_path = "tmp_eval_model"
+    results = {}
     
+    # Save model from main process
     if is_main_process():
         if os.path.exists(temp_path):
             shutil.rmtree(temp_path)
         wrapper.save(temp_path)
     
+    # Wait for model to be saved
     synchronize_between_processes()
     
-    try:
-        if is_main_process():
+    # Only main process runs evaluation to avoid NCCL conflicts
+    if is_main_process():
+        try:
+            from lm_eval import evaluator
+            from lm_eval.models.huggingface import HFLM
+        except ImportError:
+            print("lm-evaluation-harness not installed. Please install it with: pip install lm-eval")
+            synchronize_between_processes()
+            return {}
+        
+        try:
             print(f"Cargando modelo para evaluacion desde {temp_path}...", flush=True)
-        
-        lm = HFLM(
-            pretrained=temp_path,
-            batch_size=batch_size,
-            trust_remote_code=True,
-        )
-        
-        task_names = [b["name"] for b in benchmarks]
-        num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
-        
-        results = {}
-        
-        for task in task_names:
-            try:
-                if is_main_process():
+            
+            lm = HFLM(
+                pretrained=temp_path,
+                batch_size=batch_size,
+                trust_remote_code=True,
+            )
+            
+            task_names = [b["name"] for b in benchmarks]
+            num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
+            
+            for task in task_names:
+                try:
                     print(f"Evaluando benchmark: {task} (num_fewshot={num_fewshot_map[task]})...", flush=True)
-                
-                eval_results = evaluator.simple_evaluate(
-                    model=lm,
-                    tasks=[task],
-                    num_fewshot=num_fewshot_map[task],
-                    batch_size=batch_size,
-                )
-                
-                if eval_results and "results" in eval_results:
-                    task_results = eval_results["results"].get(task, {})
-                    acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
-                    results[task] = acc
-                    if is_main_process():
+                    
+                    eval_results = evaluator.simple_evaluate(
+                        model=lm,
+                        tasks=[task],
+                        num_fewshot=num_fewshot_map[task],
+                        batch_size=batch_size,
+                    )
+                    
+                    if eval_results and "results" in eval_results:
+                        task_results = eval_results["results"].get(task, {})
+                        acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
+                        results[task] = acc
                         print(f"  {task}: {acc}", flush=True)
-                else:
-                    results[task] = None
-                
-            except Exception as e:
-                if is_main_process():
+                    else:
+                        results[task] = None
+                    
+                except Exception as e:
                     print(f"Error evaluating {task}: {e}", flush=True)
-                results[task] = None
-                
-    finally:
-        synchronize_between_processes()
-        if is_main_process() and os.path.exists(temp_path):
-            try:
-                shutil.rmtree(temp_path)
-            except:
-                pass
+                    results[task] = None
+                    
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    shutil.rmtree(temp_path)
+                except:
+                    pass
+    
+    # All processes wait for evaluation to complete
+    synchronize_between_processes()
+    
+    # Broadcast results from rank 0 to all other ranks
+    if is_distributed():
+        import pickle
+        if is_main_process():
+            results_bytes = pickle.dumps(results)
+            results_tensor = torch.ByteTensor(list(results_bytes)).cuda()
+            size_tensor = torch.tensor([len(results_bytes)], dtype=torch.long).cuda()
+        else:
+            size_tensor = torch.tensor([0], dtype=torch.long).cuda()
+        
+        # Broadcast size first
+        dist.broadcast(size_tensor, src=0)
+        
+        if not is_main_process():
+            results_tensor = torch.ByteTensor(size_tensor.item()).cuda()
+        
+        # Broadcast results
+        dist.broadcast(results_tensor, src=0)
+        
+        if not is_main_process():
+            results_bytes = bytes(results_tensor.cpu().tolist())
+            results = pickle.loads(results_bytes)
     
     return results

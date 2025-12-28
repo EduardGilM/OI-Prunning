@@ -394,8 +394,44 @@ def evaluate_with_harness(
     
     # Reinitialize distributed mode if it was active before
     if was_distributed and world_size > 1:
+        import time
+        
+        # Use file-based barrier since process group was destroyed
+        barrier_dir = "tmp_dist_barrier"
+        os.makedirs(barrier_dir, exist_ok=True)
+        
+        # Rank 0 signals it's ready to reinitialize
+        if rank == 0:
+            ready_file = os.path.join(barrier_dir, "rank0_ready")
+            with open(ready_file, 'w') as f:
+                f.write('ready')
+        else:
+            # Other ranks wait for rank 0 to be ready
+            ready_file = os.path.join(barrier_dir, "rank0_ready")
+            max_wait = 7200  # 2 hour max wait for evaluation
+            waited = 0
+            while not os.path.exists(ready_file) and waited < max_wait:
+                time.sleep(1)
+                waited += 1
+            
+            if waited >= max_wait:
+                raise RuntimeError(f"Rank {rank} timed out waiting for rank 0")
+        
+        # Small delay to ensure all processes see the file
+        time.sleep(1)
+        
         # Need to reinitialize the process group
         dist.init_process_group(backend="nccl")
+        
+        # Synchronize after reinit
+        dist.barrier()
+        
+        # Clean up barrier files on rank 0
+        if rank == 0:
+            try:
+                shutil.rmtree(barrier_dir)
+            except:
+                pass
         
         # Broadcast results from rank 0 to all other ranks
         if is_main_process():

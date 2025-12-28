@@ -397,28 +397,40 @@ def evaluate_with_harness(
         import time
         
         # Use file-based barrier since process group was destroyed
-        barrier_dir = "tmp_dist_barrier"
-        os.makedirs(barrier_dir, exist_ok=True)
+        # Use absolute path in /tmp to ensure all ranks see the same file
+        barrier_dir = "/tmp/oi_pruning_dist_barrier"
+        ready_file = os.path.join(barrier_dir, "rank0_ready")
         
-        # Rank 0 signals it's ready to reinitialize
+        # Clean up any stale barrier files first (all ranks try, only one succeeds)
         if rank == 0:
-            ready_file = os.path.join(barrier_dir, "rank0_ready")
+            if os.path.exists(barrier_dir):
+                try:
+                    shutil.rmtree(barrier_dir)
+                except:
+                    pass
+            os.makedirs(barrier_dir, exist_ok=True)
+            
+            # Signal that rank 0 is ready to reinitialize
             with open(ready_file, 'w') as f:
                 f.write('ready')
+            print(f"Rank 0: Created barrier file at {ready_file}", flush=True)
         else:
             # Other ranks wait for rank 0 to be ready
-            ready_file = os.path.join(barrier_dir, "rank0_ready")
             max_wait = 7200  # 2 hour max wait for evaluation
             waited = 0
+            print(f"Rank {rank}: Waiting for barrier file at {ready_file}...", flush=True)
             while not os.path.exists(ready_file) and waited < max_wait:
                 time.sleep(1)
                 waited += 1
+                if waited % 60 == 0:
+                    print(f"Rank {rank}: Still waiting... ({waited}s)", flush=True)
             
             if waited >= max_wait:
                 raise RuntimeError(f"Rank {rank} timed out waiting for rank 0")
+            print(f"Rank {rank}: Found barrier file after {waited}s", flush=True)
         
         # Small delay to ensure all processes see the file
-        time.sleep(1)
+        time.sleep(2)
         
         # Need to reinitialize the process group
         dist.init_process_group(backend="nccl")

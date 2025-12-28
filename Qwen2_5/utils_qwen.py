@@ -304,12 +304,12 @@ def evaluate_with_harness(
     """
     Evaluate model on benchmarks using lm-evaluation-harness.
     
-    NOTE: This runs ONLY on the main process (rank 0) to avoid NCCL deadlocks.
-    The lm_eval library doesn't support multi-process distributed evaluation
-    within an existing process group, so we run evaluation on rank 0 only
-    while other ranks wait at the barrier.
+    NOTE: To avoid NCCL deadlocks, we destroy the distributed process group
+    before evaluation and reinitialize it afterward. lm_eval can trigger
+    internal CUDA/NCCL operations that conflict with an existing process group.
     """
     import shutil
+    import pickle
     
     if benchmarks is None:
         benchmarks = BENCHMARKS
@@ -317,75 +317,88 @@ def evaluate_with_harness(
     temp_path = "tmp_eval_model"
     results = {}
     
-    # Save model from main process
+    was_distributed = is_distributed()
+    world_size = get_world_size()
+    rank = get_rank()
+    
+    # Save model from main process before destroying process group
     if is_main_process():
         if os.path.exists(temp_path):
             shutil.rmtree(temp_path)
         wrapper.save(temp_path)
     
-    # Wait for model to be saved
-    synchronize_between_processes()
+    # Wait for model to be saved, then destroy process group
+    if was_distributed:
+        synchronize_between_processes()
+        dist.destroy_process_group()
     
-    # Only main process runs evaluation to avoid NCCL conflicts
-    if is_main_process():
+    # Only main process runs evaluation (no NCCL conflicts now)
+    if rank == 0:
         try:
             from lm_eval import evaluator
             from lm_eval.models.huggingface import HFLM
         except ImportError:
             print("lm-evaluation-harness not installed. Please install it with: pip install lm-eval")
-            synchronize_between_processes()
-            return {}
-        
-        try:
-            print(f"Cargando modelo para evaluacion desde {temp_path}...", flush=True)
-            
-            lm = HFLM(
-                pretrained=temp_path,
-                batch_size=batch_size,
-                trust_remote_code=True,
-            )
-            
-            task_names = [b["name"] for b in benchmarks]
-            num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
-            
-            for task in task_names:
-                try:
-                    print(f"Evaluando benchmark: {task} (num_fewshot={num_fewshot_map[task]})...", flush=True)
-                    
-                    eval_results = evaluator.simple_evaluate(
-                        model=lm,
-                        tasks=[task],
-                        num_fewshot=num_fewshot_map[task],
-                        batch_size=batch_size,
-                    )
-                    
-                    if eval_results and "results" in eval_results:
-                        task_results = eval_results["results"].get(task, {})
-                        acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
-                        results[task] = acc
-                        print(f"  {task}: {acc}", flush=True)
-                    else:
+            results = {}
+        else:
+            try:
+                print(f"Cargando modelo para evaluacion desde {temp_path}...", flush=True)
+                
+                lm = HFLM(
+                    pretrained=temp_path,
+                    batch_size=batch_size,
+                    trust_remote_code=True,
+                )
+                
+                task_names = [b["name"] for b in benchmarks]
+                num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
+                
+                for task in task_names:
+                    try:
+                        print(f"Evaluando benchmark: {task} (num_fewshot={num_fewshot_map[task]})...", flush=True)
+                        
+                        eval_results = evaluator.simple_evaluate(
+                            model=lm,
+                            tasks=[task],
+                            num_fewshot=num_fewshot_map[task],
+                            batch_size=batch_size,
+                        )
+                        
+                        if eval_results and "results" in eval_results:
+                            task_results = eval_results["results"].get(task, {})
+                            acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
+                            results[task] = acc
+                            print(f"  {task}: {acc}", flush=True)
+                        else:
+                            results[task] = None
+                        
+                    except Exception as e:
+                        print(f"Error evaluating {task}: {e}", flush=True)
                         results[task] = None
-                    
-                except Exception as e:
-                    print(f"Error evaluating {task}: {e}", flush=True)
-                    results[task] = None
-                    
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    shutil.rmtree(temp_path)
-                except:
-                    pass
+                
+                # Clean up lm_eval model to free GPU memory
+                del lm
+                torch.cuda.empty_cache()
+                        
+            finally:
+                if os.path.exists(temp_path):
+                    try:
+                        shutil.rmtree(temp_path)
+                    except:
+                        pass
+        
+        # Serialize results for sharing
+        results_bytes = pickle.dumps(results)
+    else:
+        results_bytes = None
     
-    # All processes wait for evaluation to complete
-    synchronize_between_processes()
-    
-    # Broadcast results from rank 0 to all other ranks
-    if is_distributed():
-        import pickle
+    # Reinitialize distributed mode if it was active before
+    if was_distributed and world_size > 1:
+        # Need to reinitialize the process group
+        dist.init_process_group(backend="nccl")
+        
+        # Broadcast results from rank 0 to all other ranks
         if is_main_process():
-            results_bytes = pickle.dumps(results)
             results_tensor = torch.ByteTensor(list(results_bytes)).cuda()
             size_tensor = torch.tensor([len(results_bytes)], dtype=torch.long).cuda()
         else:

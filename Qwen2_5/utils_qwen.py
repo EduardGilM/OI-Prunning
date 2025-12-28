@@ -304,12 +304,13 @@ def evaluate_with_harness(
     """
     Evaluate model on benchmarks using lm-evaluation-harness.
     
-    NOTE: To avoid NCCL deadlocks, we destroy the distributed process group
-    before evaluation and reinitialize it afterward. lm_eval can trigger
-    internal CUDA/NCCL operations that conflict with an existing process group.
+    NOTE: We run lm_eval in a subprocess to completely isolate it from the 
+    distributed training context. This avoids NCCL/CUDA conflicts.
     """
     import shutil
     import pickle
+    import subprocess
+    import json
     
     if benchmarks is None:
         benchmarks = BENCHMARKS
@@ -321,148 +322,128 @@ def evaluate_with_harness(
     world_size = get_world_size()
     rank = get_rank()
     
-    # Save model from main process before destroying process group
+    # Save model from main process
     if is_main_process():
         if os.path.exists(temp_path):
             shutil.rmtree(temp_path)
         wrapper.save(temp_path)
     
-    # Wait for model to be saved, then destroy process group
+    # Synchronize all processes
     if was_distributed:
         synchronize_between_processes()
-        dist.destroy_process_group()
     
-    # Only main process runs evaluation (no NCCL conflicts now)
+    # Only main process runs evaluation
     if rank == 0:
-        try:
-            from lm_eval import evaluator
-            from lm_eval.models.huggingface import HFLM
-        except ImportError:
-            print("lm-evaluation-harness not installed. Please install it with: pip install lm-eval")
-            results = {}
-        else:
+        print(f"Cargando modelo para evaluacion desde {temp_path}...", flush=True)
+        
+        task_names = [b["name"] for b in benchmarks]
+        num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
+        
+        for task in task_names:
             try:
-                print(f"Cargando modelo para evaluacion desde {temp_path}...", flush=True)
+                print(f"Evaluando benchmark: {task} (num_fewshot={num_fewshot_map[task]})...", flush=True)
                 
-                lm = HFLM(
-                    pretrained=temp_path,
-                    batch_size=batch_size,
-                    trust_remote_code=True,
+                # Run lm_eval in a subprocess to isolate from distributed context
+                eval_script = f'''
+import json
+from lm_eval import evaluator
+from lm_eval.models.huggingface import HFLM
+
+lm = HFLM(
+    pretrained="{temp_path}",
+    batch_size={batch_size},
+    trust_remote_code=True,
+)
+
+eval_results = evaluator.simple_evaluate(
+    model=lm,
+    tasks=["{task}"],
+    num_fewshot={num_fewshot_map[task]},
+    batch_size={batch_size},
+)
+
+if eval_results and "results" in eval_results:
+    task_results = eval_results["results"].get("{task}", {{}})
+    acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
+    print(json.dumps({{"acc": acc}}))
+else:
+    print(json.dumps({{"acc": None}}))
+'''
+                
+                result = subprocess.run(
+                    ["python", "-c", eval_script],
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"},  # Use only GPU 0
                 )
                 
-                task_names = [b["name"] for b in benchmarks]
-                num_fewshot_map = {b["name"]: b.get("num_fewshot", 0) for b in benchmarks}
-                
-                for task in task_names:
-                    try:
-                        print(f"Evaluando benchmark: {task} (num_fewshot={num_fewshot_map[task]})...", flush=True)
-                        
-                        eval_results = evaluator.simple_evaluate(
-                            model=lm,
-                            tasks=[task],
-                            num_fewshot=num_fewshot_map[task],
-                            batch_size=batch_size,
-                        )
-                        
-                        if eval_results and "results" in eval_results:
-                            task_results = eval_results["results"].get(task, {})
-                            acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
-                            results[task] = acc
-                            print(f"  {task}: {acc}", flush=True)
-                        else:
-                            results[task] = None
-                        
-                    except Exception as e:
-                        print(f"Error evaluating {task}: {e}", flush=True)
+                if result.returncode == 0:
+                    # Parse the last line which should be our JSON output
+                    output_lines = result.stdout.strip().split('\n')
+                    for line in reversed(output_lines):
+                        try:
+                            parsed = json.loads(line)
+                            results[task] = parsed.get("acc")
+                            print(f"  {task}: {results[task]}", flush=True)
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                    else:
+                        print(f"  {task}: Could not parse result", flush=True)
                         results[task] = None
-                
-                # Clean up lm_eval model to free GPU memory
-                del lm
-                torch.cuda.empty_cache()
-                        
-            finally:
-                if os.path.exists(temp_path):
-                    try:
-                        shutil.rmtree(temp_path)
-                    except:
-                        pass
+                else:
+                    print(f"Error evaluating {task}: {result.stderr}", flush=True)
+                    results[task] = None
+                    
+            except Exception as e:
+                print(f"Error evaluating {task}: {e}", flush=True)
+                results[task] = None
+        
+        # Clean up temp model
+        if os.path.exists(temp_path):
+            try:
+                shutil.rmtree(temp_path)
+            except:
+                pass
         
         # Serialize results for sharing
         results_bytes = pickle.dumps(results)
     else:
         results_bytes = None
     
-    # Reinitialize distributed mode if it was active before
+    # Share results with all processes
     if was_distributed and world_size > 1:
         import time
         
-        # Use file-based barrier since process group was destroyed
-        # Use absolute path in /tmp to ensure all ranks see the same file
-        barrier_dir = "/tmp/oi_pruning_dist_barrier"
-        ready_file = os.path.join(barrier_dir, "rank0_ready")
+        # Use file-based sharing since we want to avoid messing with process groups
+        results_file = "/tmp/oi_pruning_eval_results.pkl"
         
-        # Clean up any stale barrier files first (all ranks try, only one succeeds)
         if rank == 0:
-            if os.path.exists(barrier_dir):
-                try:
-                    shutil.rmtree(barrier_dir)
-                except:
-                    pass
-            os.makedirs(barrier_dir, exist_ok=True)
-            
-            # Signal that rank 0 is ready to reinitialize
-            with open(ready_file, 'w') as f:
-                f.write('ready')
-            print(f"Rank 0: Created barrier file at {ready_file}", flush=True)
+            with open(results_file, 'wb') as f:
+                pickle.dump(results, f)
+            # Signal completion
+            with open(results_file + ".done", 'w') as f:
+                f.write('done')
         else:
-            # Other ranks wait for rank 0 to be ready
-            max_wait = 7200  # 2 hour max wait for evaluation
+            # Wait for results
+            max_wait = 7200
             waited = 0
-            print(f"Rank {rank}: Waiting for barrier file at {ready_file}...", flush=True)
-            while not os.path.exists(ready_file) and waited < max_wait:
+            while not os.path.exists(results_file + ".done") and waited < max_wait:
                 time.sleep(1)
                 waited += 1
-                if waited % 60 == 0:
-                    print(f"Rank {rank}: Still waiting... ({waited}s)", flush=True)
             
-            if waited >= max_wait:
-                raise RuntimeError(f"Rank {rank} timed out waiting for rank 0")
-            print(f"Rank {rank}: Found barrier file after {waited}s", flush=True)
+            if os.path.exists(results_file):
+                with open(results_file, 'rb') as f:
+                    results = pickle.load(f)
         
-        # Small delay to ensure all processes see the file
-        time.sleep(2)
+        # Barrier before cleanup
+        synchronize_between_processes()
         
-        # Need to reinitialize the process group
-        dist.init_process_group(backend="nccl")
-        
-        # Synchronize after reinit
-        dist.barrier()
-        
-        # Clean up barrier files on rank 0
         if rank == 0:
             try:
-                shutil.rmtree(barrier_dir)
+                os.remove(results_file)
+                os.remove(results_file + ".done")
             except:
                 pass
-        
-        # Broadcast results from rank 0 to all other ranks
-        if is_main_process():
-            results_tensor = torch.ByteTensor(list(results_bytes)).cuda()
-            size_tensor = torch.tensor([len(results_bytes)], dtype=torch.long).cuda()
-        else:
-            size_tensor = torch.tensor([0], dtype=torch.long).cuda()
-        
-        # Broadcast size first
-        dist.broadcast(size_tensor, src=0)
-        
-        if not is_main_process():
-            results_tensor = torch.ByteTensor(size_tensor.item()).cuda()
-        
-        # Broadcast results
-        dist.broadcast(results_tensor, src=0)
-        
-        if not is_main_process():
-            results_bytes = bytes(results_tensor.cpu().tolist())
-            results = pickle.loads(results_bytes)
     
     return results

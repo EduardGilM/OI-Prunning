@@ -306,11 +306,16 @@ def evaluate_with_harness(
     
     NOTE: We run lm_eval in a subprocess to completely isolate it from the 
     distributed training context. This avoids NCCL/CUDA conflicts.
+    
+    IMPORTANT: This function uses file-based synchronization to avoid NCCL
+    collective operations during evaluation. Non-main processes poll for
+    results without using barriers.
     """
     import shutil
     import pickle
     import subprocess
     import json
+    import time
     
     if benchmarks is None:
         benchmarks = BENCHMARKS
@@ -322,17 +327,50 @@ def evaluate_with_harness(
     world_size = get_world_size()
     rank = get_rank()
     
+    # Use /tmp on Linux, temp folder on Windows
+    if os.name == 'nt':
+        results_file = os.path.join(os.environ.get('TEMP', '.'), 'oi_pruning_eval_results.pkl')
+    else:
+        results_file = "/tmp/oi_pruning_eval_results.pkl"
+    done_file = results_file + ".done"
+    
+    # Clean up any stale files from previous runs (only rank 0)
+    if rank == 0:
+        for f in [results_file, done_file]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+    
+    # Brief pause to ensure cleanup is visible to all ranks
+    if was_distributed:
+        time.sleep(1)
+    
     # Save model from main process
     if is_main_process():
         if os.path.exists(temp_path):
             shutil.rmtree(temp_path)
         wrapper.save(temp_path)
+        print(f"Modelo guardado en {temp_path} para evaluación", flush=True)
     
-    # Synchronize all processes
-    if was_distributed:
-        synchronize_between_processes()
+    # Use file-based synchronization instead of NCCL barrier
+    # Rank 0 will write a "model_saved" flag file, others wait for it
+    if was_distributed and world_size > 1:
+        model_ready_file = results_file + ".model_ready"
+        
+        if rank == 0:
+            with open(model_ready_file, 'w') as f:
+                f.write('ready')
+        else:
+            # Wait for model to be saved (without using NCCL)
+            max_wait = 300  # 5 minutes max
+            waited = 0
+            while not os.path.exists(model_ready_file) and waited < max_wait:
+                time.sleep(0.5)
+                waited += 0.5
     
-    # Only main process runs evaluation
+    # Only main process runs evaluation - other processes wait for results
     if rank == 0:
         print(f"Cargando modelo para evaluacion desde {temp_path}...", flush=True)
         
@@ -344,8 +382,26 @@ def evaluate_with_harness(
                 print(f"Evaluando benchmark: {task} (num_fewshot={num_fewshot_map[task]})...", flush=True)
                 
                 # Run lm_eval in a subprocess to isolate from distributed context
+                # CRITICAL: Clear distributed environment variables to prevent subprocess
+                # from attempting to use NCCL
+                clean_env = {k: v for k, v in os.environ.items() 
+                            if k not in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK', 
+                                        'MASTER_ADDR', 'MASTER_PORT']}
+                clean_env["CUDA_VISIBLE_DEVICES"] = "0"
+                
                 eval_script = f'''
 import json
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+# Ensure no distributed setup in subprocess
+os.environ.pop("RANK", None)
+os.environ.pop("WORLD_SIZE", None)
+os.environ.pop("LOCAL_RANK", None)
+os.environ.pop("MASTER_ADDR", None)
+os.environ.pop("MASTER_PORT", None)
+
 from lm_eval import evaluator
 from lm_eval.models.huggingface import HFLM
 
@@ -371,10 +427,11 @@ else:
 '''
                 
                 result = subprocess.run(
-                    ["python", "-c", eval_script],
+                    [sys.executable, "-c", eval_script],
                     capture_output=True,
                     text=True,
-                    env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"},  # Use only GPU 0
+                    env=clean_env,
+                    timeout=7200,  # 2 hour timeout per task
                 )
                 
                 if result.returncode == 0:
@@ -395,6 +452,9 @@ else:
                     print(f"Error evaluating {task}: {result.stderr}", flush=True)
                     results[task] = None
                     
+            except subprocess.TimeoutExpired:
+                print(f"Timeout evaluating {task}", flush=True)
+                results[task] = None
             except Exception as e:
                 print(f"Error evaluating {task}: {e}", flush=True)
                 results[task] = None
@@ -406,44 +466,48 @@ else:
             except:
                 pass
         
-        # Serialize results for sharing
-        results_bytes = pickle.dumps(results)
-    else:
-        results_bytes = None
-    
-    # Share results with all processes
-    if was_distributed and world_size > 1:
-        import time
-        
-        # Use file-based sharing since we want to avoid messing with process groups
-        results_file = "/tmp/oi_pruning_eval_results.pkl"
-        
-        if rank == 0:
+        # Write results for other ranks to read
+        if was_distributed and world_size > 1:
             with open(results_file, 'wb') as f:
                 pickle.dump(results, f)
-            # Signal completion
-            with open(results_file + ".done", 'w') as f:
+            # Signal completion AFTER writing results
+            with open(done_file, 'w') as f:
                 f.write('done')
-        else:
-            # Wait for results
-            max_wait = 7200
-            waited = 0
-            while not os.path.exists(results_file + ".done") and waited < max_wait:
-                time.sleep(1)
-                waited += 1
-            
-            if os.path.exists(results_file):
+            print("Resultados escritos para otros procesos", flush=True)
+    
+    else:
+        # Non-main processes: wait for results file (NO NCCL operations)
+        max_wait = 7200  # 2 hours max
+        waited = 0
+        poll_interval = 2  # Check every 2 seconds
+        
+        while not os.path.exists(done_file) and waited < max_wait:
+            time.sleep(poll_interval)
+            waited += poll_interval
+        
+        if os.path.exists(results_file):
+            # Small delay to ensure file is fully written
+            time.sleep(0.5)
+            try:
                 with open(results_file, 'rb') as f:
                     results = pickle.load(f)
-        
-        # Barrier before cleanup
-        synchronize_between_processes()
-        
-        if rank == 0:
-            try:
-                os.remove(results_file)
-                os.remove(results_file + ".done")
-            except:
-                pass
+            except Exception as e:
+                print(f"[Rank {rank}] Error reading results: {e}", flush=True)
+                results = {b["name"]: None for b in benchmarks}
+        else:
+            print(f"[Rank {rank}] Timeout waiting for evaluation results", flush=True)
+            results = {b["name"]: None for b in benchmarks}
+    
+    # Brief pause before cleanup to ensure all ranks have read results
+    time.sleep(2)
+    
+    # Cleanup helper files (only rank 0)
+    if rank == 0 and was_distributed:
+        for f in [results_file, done_file, results_file + ".model_ready"]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
     
     return results

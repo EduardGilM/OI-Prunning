@@ -22,6 +22,60 @@ from utils.oinfo import calculate_oinfo_gradient_distributed, calculate_oinfo_gr
 from utils.distributed import is_main_process, init_distributed_mode, synchronize_between_processes, get_rank, get_world_size
 import transformers
 import datasets
+import time
+
+
+def file_based_sync(tag="sync"):
+    """
+    File-based synchronization that doesn't use NCCL.
+    Safe to use when NCCL operations might be problematic.
+    """
+    import os
+    
+    rank = get_rank()
+    world_size = get_world_size()
+    
+    if world_size <= 1:
+        return
+    
+    # Determine temp directory based on OS
+    if os.name == 'nt':
+        temp_dir = os.environ.get('TEMP', '.')
+    else:
+        temp_dir = "/tmp"
+    
+    sync_base = os.path.join(temp_dir, f"oi_pruning_{tag}")
+    my_file = f"{sync_base}_rank{rank}.ready"
+    
+    # Signal that this rank is ready
+    with open(my_file, 'w') as f:
+        f.write('ready')
+    
+    # Wait for all ranks to be ready
+    max_wait = 300  # 5 minutes
+    waited = 0
+    while waited < max_wait:
+        all_ready = True
+        for r in range(world_size):
+            if not os.path.exists(f"{sync_base}_rank{r}.ready"):
+                all_ready = False
+                break
+        if all_ready:
+            break
+        time.sleep(0.5)
+        waited += 0.5
+    
+    # Small delay to ensure all ranks have seen the files
+    time.sleep(0.5)
+    
+    # Cleanup (only rank 0)
+    if rank == 0:
+        time.sleep(1)  # Extra delay before cleanup
+        for r in range(world_size):
+            try:
+                os.remove(f"{sync_base}_rank{r}.ready")
+            except:
+                pass
 
 
 def get_layerwise_activations(wrapper, max_samples=1000):
@@ -147,8 +201,8 @@ def prune_qwen_global():
             else:
                 print(f"  {benchmark}: Error")
     
-    # Ensure all finished
-    synchronize_between_processes()
+    # Use file-based sync after evaluation to avoid NCCL issues
+    file_based_sync("baseline_eval")
     
     history = {
         'iteration': [0],
@@ -292,7 +346,8 @@ def prune_qwen_global():
                 else:
                     print(f"  {benchmark}: Error")
         
-        synchronize_between_processes()
+        # Use file-based sync after evaluation to avoid NCCL issues
+        file_based_sync(f"iter_{iteration}_eval")
         
         history['iteration'].append(iteration)
         history['params'].append(wrapper.count_parameters())

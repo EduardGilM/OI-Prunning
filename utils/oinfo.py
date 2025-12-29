@@ -199,6 +199,9 @@ def calculate_oinfo_gradient_distributed(X, k=3) -> Tuple[np.ndarray, float]:
     X_t = X_t.to(device)
     N, d = X_t.shape
     
+    # Synchronize before starting computation to ensure all ranks are ready
+    dist.barrier()
+    
     def torch_entropy_knn(X_t, k=3, eps=1e-12):
         N, d = X_t.shape
         X_noise = X_t + eps * torch.randn_like(X_t)
@@ -243,18 +246,31 @@ def calculate_oinfo_gradient_distributed(X, k=3) -> Tuple[np.ndarray, float]:
         omega_minus_j = torch_calculate_oinfo(X_t[:, mask], k)
         local_grads.append((omega_X - omega_minus_j).item())
     
-    all_grads = [None] * world_size if rank == 0 else None
-    dist.gather_object(local_grads, all_grads, dst=0)
+    # Convert local gradients to tensor for all_gather
+    # Pad to same length across all GPUs
+    local_tensor = torch.zeros(neurons_per_gpu, device=device, dtype=torch.float64)
+    local_tensor[:len(local_grads)] = torch.tensor(local_grads, device=device, dtype=torch.float64)
     
-    if rank == 0:
-        grads_list = []
-        for gpu_grads in all_grads:
-            grads_list.extend(gpu_grads)
-        grads_np = np.array(grads_list[:d], dtype=np.float64)
-    else:
-        grads_np = np.zeros(d, dtype=np.float64)
+    # Synchronize before collective operation
+    dist.barrier()
     
-    dist.broadcast_object_list([grads_np], src=0)
+    # Use all_gather with tensors (more reliable than gather_object)
+    gathered_tensors = [torch.zeros_like(local_tensor) for _ in range(world_size)]
+    dist.all_gather(gathered_tensors, local_tensor)
+    
+    # Combine results
+    grads_list = []
+    for i, tensor in enumerate(gathered_tensors):
+        # Calculate how many valid gradients this rank contributed
+        gpu_start = i * neurons_per_gpu
+        gpu_end = min((i + 1) * neurons_per_gpu, d)
+        num_valid = gpu_end - gpu_start
+        grads_list.extend(tensor[:num_valid].cpu().numpy().tolist())
+    
+    grads_np = np.array(grads_list[:d], dtype=np.float64)
+    
+    # Final synchronization
+    dist.barrier()
     
     return grads_np, omega_X.item()
 

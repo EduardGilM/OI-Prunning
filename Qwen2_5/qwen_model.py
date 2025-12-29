@@ -141,13 +141,69 @@ class QwenWrapper:
         return sum(p.numel() for p in self.model.parameters())
 
     def save(self, path: str):
+        """
+        Save the model with updated config reflecting pruned dimensions.
+        
+        IMPORTANT: For pruned models, we need to update the config's intermediate_size
+        to reflect the new (possibly varying) layer dimensions. Since standard Qwen
+        config only supports a single intermediate_size, we save the actual per-layer
+        dimensions in a custom field.
+        """
+        import os
+        import json
+        
+        # Update config to reflect pruned dimensions
+        current_dims = self.get_mlp_dimensions()
+        
+        # If all layers have the same dimension, update intermediate_size
+        if len(set(current_dims)) == 1:
+            self.model.config.intermediate_size = current_dims[0]
+        else:
+            # For varying dimensions, save the minimum (for compatibility)
+            # and store actual dimensions in custom config
+            self.model.config.intermediate_size = min(current_dims)
+        
+        # Save custom attribute for per-layer dimensions
+        self.model.config.pruned_layer_dims = current_dims
+        
         self.model.save_pretrained(path)
         self.tokenizer.save_pretrained(path)
+        
+        # Also save a metadata file with pruning info
+        metadata = {
+            "is_pruned": True,
+            "original_intermediate_size": getattr(self.config, 'intermediate_size', None),
+            "pruned_layer_dims": current_dims,
+            "num_layers": self.num_layers,
+            "hidden_size": self.hidden_size,
+        }
+        metadata_path = os.path.join(path, "pruning_metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
 
     @classmethod
     def load(cls, path: str, device: str = None) -> 'QwenWrapper':
+        """
+        Load a saved model, handling pruned models correctly.
+        
+        For pruned models, we load the weights directly since the architecture
+        is already saved correctly in the checkpoint.
+        """
+        import os
+        import json
+        
         wrapper = cls.__new__(cls)
         wrapper.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Check if this is a pruned model by looking for metadata
+        metadata_path = os.path.join(path, "pruning_metadata.json")
+        is_pruned = os.path.exists(metadata_path)
+        
+        if is_pruned:
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+        
+        # Load the model - HuggingFace will use the saved config
         wrapper.model = AutoModelForCausalLM.from_pretrained(
             path,
             torch_dtype=torch.float16,

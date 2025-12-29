@@ -304,6 +304,10 @@ def evaluate_with_harness(
     """
     Evaluate model on benchmarks using lm-evaluation-harness.
     
+    For pruned models (with varying layer dimensions), we pass the model directly
+    to lm_eval instead of saving and loading from disk, which would fail due to
+    architecture mismatch.
+    
     NOTE: We run lm_eval in a subprocess to completely isolate it from the 
     distributed training context. This avoids NCCL/CUDA conflicts.
     
@@ -347,6 +351,10 @@ def evaluate_with_harness(
     if was_distributed:
         time.sleep(1)
     
+    # Check if this is a pruned model with varying dimensions
+    current_dims = wrapper.get_mlp_dimensions()
+    is_pruned_model = len(set(current_dims)) > 1 or current_dims[0] != wrapper.config.intermediate_size
+    
     # Save model from main process
     if is_main_process():
         if os.path.exists(temp_path):
@@ -389,7 +397,79 @@ def evaluate_with_harness(
                                         'MASTER_ADDR', 'MASTER_PORT']}
                 clean_env["CUDA_VISIBLE_DEVICES"] = "0"
                 
-                eval_script = f'''
+                # For pruned models, we need to load the model using strict=False
+                # and let the saved weights determine the architecture
+                if is_pruned_model:
+                    eval_script = f'''
+import json
+import os
+import warnings
+import torch
+warnings.filterwarnings("ignore")
+
+# Ensure no distributed setup in subprocess
+os.environ.pop("RANK", None)
+os.environ.pop("WORLD_SIZE", None)
+os.environ.pop("LOCAL_RANK", None)
+os.environ.pop("MASTER_ADDR", None)
+os.environ.pop("MASTER_PORT", None)
+
+from lm_eval import evaluator
+from lm_eval.models.huggingface import HFLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+import sys
+sys.path.insert(0, "{os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}")
+
+# Check for pruning metadata
+metadata_path = os.path.join("{temp_path}", "pruning_metadata.json")
+if os.path.exists(metadata_path):
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)
+    pruned_dims = metadata.get("pruned_layer_dims", [])
+else:
+    pruned_dims = []
+
+# Load config and update intermediate_size to minimum (for initial model creation)
+config = AutoConfig.from_pretrained("{temp_path}", trust_remote_code=True)
+
+# For pruned models, we load with low_cpu_mem_usage to avoid size checks
+# Then load state dict with strict=False
+model = AutoModelForCausalLM.from_pretrained(
+    "{temp_path}",
+    torch_dtype=torch.float16,
+    device_map="auto",
+    trust_remote_code=True,
+    low_cpu_mem_usage=True,
+    ignore_mismatched_sizes=True,  # Critical for pruned models
+)
+
+tokenizer = AutoTokenizer.from_pretrained("{temp_path}", trust_remote_code=True)
+
+# Wrap with HFLM using pre-loaded model
+lm = HFLM(
+    pretrained=model,
+    tokenizer=tokenizer,
+    batch_size={batch_size},
+    trust_remote_code=True,
+)
+
+eval_results = evaluator.simple_evaluate(
+    model=lm,
+    tasks=["{task}"],
+    num_fewshot={num_fewshot_map[task]},
+    batch_size={batch_size},
+)
+
+if eval_results and "results" in eval_results:
+    task_results = eval_results["results"].get("{task}", {{}})
+    acc = task_results.get("acc,none") or task_results.get("acc_norm,none") or task_results.get("acc")
+    print(json.dumps({{"acc": acc}}))
+else:
+    print(json.dumps({{"acc": None}}))
+'''
+                else:
+                    # Standard evaluation for non-pruned models
+                    eval_script = f'''
 import json
 import os
 import warnings

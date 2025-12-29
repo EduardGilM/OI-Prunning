@@ -204,6 +204,10 @@ def prune_qwen_global():
     # Use file-based sync after evaluation to avoid NCCL issues
     file_based_sync("baseline_eval")
     
+    # NCCL barrier to ensure all processes are synchronized before pruning loop
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    
     history = {
         'iteration': [0],
         'params': [wrapper.count_parameters()],
@@ -215,6 +219,11 @@ def prune_qwen_global():
     
     while iteration < max_iterations:
         iteration += 1
+        
+        # NCCL barrier at the start of each iteration to ensure synchronization
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        
         if is_main_process():
             print(f"\n{'='*60}")
             print(f"--- Pruning Iteration {iteration} ---")
@@ -331,6 +340,10 @@ def prune_qwen_global():
             gradient_accumulation_steps=8,
             max_samples=5000,
         )
+        
+        # Synchronize after fine-tuning to ensure all processes have the same model state
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
         
         if is_main_process():
             print("\nEvaluando en benchmarks...")

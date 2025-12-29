@@ -99,6 +99,12 @@ class QwenWrapper:
         new_wrapper.num_layers = self.num_layers
         new_wrapper.hidden_size = self.hidden_size
         
+        # Preserve original model name for save/load cycle
+        if hasattr(self, '_original_model_name'):
+            new_wrapper._original_model_name = self._original_model_name
+        else:
+            new_wrapper._original_model_name = self.model_name
+        
         new_wrapper.model = copy.deepcopy(self.model)
         
         for i, (layer, mask) in enumerate(zip(new_wrapper.model.model.layers, layer_keep_masks)):
@@ -154,6 +160,10 @@ class QwenWrapper:
         
         # Update config to reflect pruned dimensions
         current_dims = self.get_mlp_dimensions()
+        original_intermediate = getattr(self.config, 'intermediate_size', current_dims[0])
+        
+        # Check if model has been pruned (dimensions differ from original)
+        is_pruned = any(d != original_intermediate for d in current_dims)
         
         # If all layers have the same dimension, update intermediate_size
         if len(set(current_dims)) == 1:
@@ -170,9 +180,23 @@ class QwenWrapper:
         self.tokenizer.save_pretrained(path)
         
         # Also save a metadata file with pruning info
+        # Determine the original model name (needed for loading)
+        original_model_name = self.model_name
+        # If model_name is a local path (from previous load), try to get the original
+        if hasattr(self, '_original_model_name'):
+            original_model_name = self._original_model_name
+        elif os.path.exists(self.model_name):
+            # It's a local path, check for existing metadata
+            existing_meta = os.path.join(self.model_name, "pruning_metadata.json")
+            if os.path.exists(existing_meta):
+                with open(existing_meta, 'r') as f:
+                    old_meta = json.load(f)
+                    original_model_name = old_meta.get("original_model_name", self.model_name)
+        
         metadata = {
-            "is_pruned": True,
-            "original_intermediate_size": getattr(self.config, 'intermediate_size', None),
+            "is_pruned": is_pruned or any(d != original_intermediate for d in current_dims),
+            "original_model_name": original_model_name,
+            "original_intermediate_size": original_intermediate,
             "pruned_layer_dims": current_dims,
             "num_layers": self.num_layers,
             "hidden_size": self.hidden_size,
@@ -186,11 +210,15 @@ class QwenWrapper:
         """
         Load a saved model, handling pruned models correctly.
         
-        For pruned models, we load the weights directly since the architecture
-        is already saved correctly in the checkpoint.
+        For pruned models with per-layer varying dimensions, we need to:
+        1. Load the base model from the original architecture
+        2. Prune it to match the saved dimensions
+        3. Load the pruned weights
         """
         import os
         import json
+        from safetensors.torch import load_file as load_safetensors
+        from glob import glob
         
         wrapper = cls.__new__(cls)
         wrapper.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -202,14 +230,89 @@ class QwenWrapper:
         if is_pruned:
             with open(metadata_path, 'r') as f:
                 metadata = json.load(f)
+            
+            pruned_dims = metadata.get("pruned_layer_dims", [])
+            original_model_name = metadata.get("original_model_name", "HuggingFaceTB/SmolLM2-135M")
+            
+            # Load the base model first (with original architecture)
+            base_model = AutoModelForCausalLM.from_pretrained(
+                original_model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            
+            # Get the config for dimensions
+            config = base_model.config
+            original_intermediate_size = config.intermediate_size
+            num_layers = config.num_hidden_layers
+            
+            # Create keep masks based on pruned dimensions
+            layer_keep_masks = []
+            for i in range(num_layers):
+                if i < len(pruned_dims):
+                    new_dim = pruned_dims[i]
+                else:
+                    new_dim = original_intermediate_size
+                
+                # Create mask: keep first new_dim neurons
+                mask = torch.zeros(original_intermediate_size, dtype=torch.bool)
+                mask[:new_dim] = True
+                layer_keep_masks.append(mask)
+            
+            # Prune the base model to match saved dimensions
+            for i, (layer, mask) in enumerate(zip(base_model.model.layers, layer_keep_masks)):
+                indices = torch.where(mask)[0]
+                new_dim = len(indices)
+                
+                if new_dim == original_intermediate_size:
+                    continue  # No pruning needed for this layer
+                
+                old_gate = layer.mlp.gate_proj
+                old_up = layer.mlp.up_proj
+                old_down = layer.mlp.down_proj
+                
+                layer_device = old_gate.weight.device
+                
+                new_gate = nn.Linear(old_gate.in_features, new_dim, bias=old_gate.bias is not None)
+                new_up = nn.Linear(old_up.in_features, new_dim, bias=old_up.bias is not None)
+                new_down = nn.Linear(new_dim, old_down.out_features, bias=old_down.bias is not None)
+                
+                layer.mlp.gate_proj = new_gate.to(layer_device).half()
+                layer.mlp.up_proj = new_up.to(layer_device).half()
+                layer.mlp.down_proj = new_down.to(layer_device).half()
+            
+            # Now load the saved weights
+            # Try safetensors first, then pytorch
+            safetensor_files = glob(os.path.join(path, "*.safetensors"))
+            if safetensor_files:
+                state_dict = {}
+                for sf in safetensor_files:
+                    state_dict.update(load_safetensors(sf))
+            else:
+                # Fall back to pytorch bin files
+                bin_files = glob(os.path.join(path, "*.bin"))
+                state_dict = {}
+                for bf in bin_files:
+                    state_dict.update(torch.load(bf, map_location="cpu"))
+            
+            # Load state dict with strict=False to handle any remaining mismatches
+            missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"Warning: Missing keys when loading pruned model: {len(missing)} keys")
+            
+            wrapper.model = base_model
+            # Preserve original model name for future saves
+            wrapper._original_model_name = original_model_name
+        else:
+            # Standard loading for non-pruned models
+            wrapper.model = AutoModelForCausalLM.from_pretrained(
+                path,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
         
-        # Load the model - HuggingFace will use the saved config
-        wrapper.model = AutoModelForCausalLM.from_pretrained(
-            path,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
         wrapper.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, fix_mistral_regex=True)
         if wrapper.tokenizer.pad_token is None:
             wrapper.tokenizer.pad_token = wrapper.tokenizer.eos_token

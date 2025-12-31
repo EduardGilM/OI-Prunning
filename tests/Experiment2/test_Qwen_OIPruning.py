@@ -24,6 +24,10 @@ import transformers
 import datasets
 import time
 
+# Set to False to always load the base model from HuggingFace
+# Set to True to resume from a previously pruned checkpoint if available
+LOAD_FROM_CHECKPOINT = False
+
 
 def file_based_sync(tag="sync"):
     """
@@ -171,7 +175,7 @@ def prune_qwen_global():
     
     pruned_path = model_dir / "qwen_pruned"
     
-    if pruned_path.exists():
+    if LOAD_FROM_CHECKPOINT and pruned_path.exists():
         if is_main_process():
             print(f"Cargando modelo prunado desde {pruned_path}")
         wrapper = QwenWrapper.load(str(pruned_path))

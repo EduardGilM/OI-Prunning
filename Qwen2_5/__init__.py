@@ -5,9 +5,12 @@ from .utils_qwen import (
     evaluate_benchmarks,
     get_calibration_data,
     load_dolly_dataset,
+    load_reasoning_datasets,
     setup_lora,
     get_device,
     BENCHMARKS,
     LORA_CONFIG,
     QUICK_MODE,
+    REASONING_DATASETS,
+    ACTIVE_REASONING_DATASETS,
 )

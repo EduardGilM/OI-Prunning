@@ -19,7 +19,38 @@ from utils.distributed import (
     synchronize_between_processes, is_distributed
 )
 
-DOLLY_DATASET = "databricks/databricks-dolly-15k"
+# Datasets para fine-tuning de razonamiento
+# Estos datasets ayudan a recuperar rendimiento en HellaSwag y ARC Challenge
+REASONING_DATASETS = {
+    # ARC - AI2 Reasoning Challenge (directamente relacionado con arc_challenge benchmark)
+    "arc": {
+        "name": "allenai/ai2_arc",
+        "subset": "ARC-Challenge",
+        "split": "train",
+    },
+    # OpenBookQA - Razonamiento con conocimiento de sentido común
+    "openbookqa": {
+        "name": "allenai/openbookqa",
+        "subset": "main",
+        "split": "train",
+    },
+    # HellaSwag training data - Directamente relacionado con hellaswag benchmark
+    "hellaswag": {
+        "name": "Rowan/hellaswag",
+        "subset": None,
+        "split": "train",
+    },
+    # CommonsenseQA - Razonamiento de sentido común
+    "commonsenseqa": {
+        "name": "tau/commonsense_qa",
+        "subset": None,
+        "split": "train",
+    },
+}
+
+# Datasets activos para LoRA fine-tuning (se pueden combinar)
+ACTIVE_REASONING_DATASETS = ["arc", "hellaswag"]  # Cambiar según necesidad
+
 CALIBRATION_SAMPLES = 1000
 
 LORA_CONFIG = {
@@ -86,8 +117,223 @@ class InstructionDataset(Dataset):
         }
 
 
+class ReasoningDataset(Dataset):
+    """
+    Dataset unificado para tareas de razonamiento (ARC, HellaSwag, OpenBookQA, CommonsenseQA).
+    Formatea los datos de múltiples fuentes en un formato consistente para LoRA fine-tuning.
+    """
+    def __init__(self, data_list: List[dict], tokenizer, max_length=512):
+        self.data = data_list
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        prompt = item["text"]
+        
+        encoded = self.tokenizer(
+            prompt,
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length",
+            return_tensors="pt"
+        )
+        
+        return {
+            "input_ids": encoded["input_ids"].squeeze(),
+            "attention_mask": encoded["attention_mask"].squeeze(),
+            "labels": encoded["input_ids"].squeeze(),
+        }
+
+
+def _format_arc_example(item) -> str:
+    """Formatea un ejemplo de ARC Challenge."""
+    question = item["question"]
+    choices = item["choices"]
+    answer_key = item["answerKey"]
+    
+    # Construir las opciones
+    options_text = ""
+    answer_text = ""
+    for i, (label, text) in enumerate(zip(choices["label"], choices["text"])):
+        options_text += f"{label}. {text}\n"
+        if label == answer_key:
+            answer_text = text
+    
+    prompt = f"""### Question:
+{question}
+
+### Options:
+{options_text}
+### Answer:
+{answer_key}. {answer_text}"""
+    return prompt
+
+
+def _format_hellaswag_example(item) -> str:
+    """Formatea un ejemplo de HellaSwag."""
+    context = item["ctx"]
+    endings = item["endings"]
+    label = int(item["label"]) if item["label"] != "" else 0
+    
+    correct_ending = endings[label] if label < len(endings) else endings[0]
+    
+    prompt = f"""### Context:
+{context}
+
+### Possible Continuations:
+A. {endings[0]}
+B. {endings[1]}
+C. {endings[2]}
+D. {endings[3]}
+
+### Most Likely Continuation:
+{correct_ending}"""
+    return prompt
+
+
+def _format_openbookqa_example(item) -> str:
+    """Formatea un ejemplo de OpenBookQA."""
+    question = item["question_stem"]
+    choices = item["choices"]
+    answer_key = item["answerKey"]
+    
+    options_text = ""
+    answer_text = ""
+    for label, text in zip(choices["label"], choices["text"]):
+        options_text += f"{label}. {text}\n"
+        if label == answer_key:
+            answer_text = text
+    
+    # Incluir el hecho del libro abierto si está disponible
+    fact = item.get("fact1", "")
+    if fact:
+        prompt = f"""### Fact:
+{fact}
+
+### Question:
+{question}
+
+### Options:
+{options_text}
+### Answer:
+{answer_key}. {answer_text}"""
+    else:
+        prompt = f"""### Question:
+{question}
+
+### Options:
+{options_text}
+### Answer:
+{answer_key}. {answer_text}"""
+    return prompt
+
+
+def _format_commonsenseqa_example(item) -> str:
+    """Formatea un ejemplo de CommonsenseQA."""
+    question = item["question"]
+    choices = item["choices"]
+    answer_key = item["answerKey"]
+    
+    options_text = ""
+    answer_text = ""
+    for label, text in zip(choices["label"], choices["text"]):
+        options_text += f"{label}. {text}\n"
+        if label == answer_key:
+            answer_text = text
+    
+    prompt = f"""### Question:
+{question}
+
+### Options:
+{options_text}
+### Answer:
+{answer_key}. {answer_text}"""
+    return prompt
+
+
+def load_reasoning_datasets(
+    tokenizer, 
+    datasets_to_use: List[str] = None, 
+    max_samples_per_dataset: int = None,
+    max_length: int = 512
+) -> ReasoningDataset:
+    """
+    Carga y combina múltiples datasets de razonamiento.
+    
+    Args:
+        tokenizer: Tokenizer del modelo
+        datasets_to_use: Lista de datasets a usar (keys de REASONING_DATASETS)
+                        Por defecto usa ACTIVE_REASONING_DATASETS
+        max_samples_per_dataset: Máximo de muestras por dataset
+        max_length: Longitud máxima de secuencia
+    
+    Returns:
+        ReasoningDataset con todos los ejemplos formateados
+    """
+    if datasets_to_use is None:
+        datasets_to_use = ACTIVE_REASONING_DATASETS
+    
+    all_examples = []
+    
+    formatters = {
+        "arc": _format_arc_example,
+        "hellaswag": _format_hellaswag_example,
+        "openbookqa": _format_openbookqa_example,
+        "commonsenseqa": _format_commonsenseqa_example,
+    }
+    
+    for dataset_key in datasets_to_use:
+        if dataset_key not in REASONING_DATASETS:
+            print(f"Warning: Dataset '{dataset_key}' no encontrado en REASONING_DATASETS")
+            continue
+        
+        config = REASONING_DATASETS[dataset_key]
+        formatter = formatters.get(dataset_key)
+        
+        if formatter is None:
+            print(f"Warning: No hay formateador para '{dataset_key}'")
+            continue
+        
+        if is_main_process():
+            print(f"Cargando dataset: {config['name']} ({dataset_key})...")
+        
+        try:
+            if config["subset"]:
+                dataset = load_dataset(config["name"], config["subset"], split=config["split"])
+            else:
+                dataset = load_dataset(config["name"], split=config["split"])
+            
+            if max_samples_per_dataset:
+                dataset = dataset.select(range(min(max_samples_per_dataset, len(dataset))))
+            
+            for item in dataset:
+                try:
+                    formatted_text = formatter(item)
+                    all_examples.append({"text": formatted_text, "source": dataset_key})
+                except Exception as e:
+                    continue  # Ignorar ejemplos problemáticos
+            
+            if is_main_process():
+                print(f"  -> {len(dataset)} ejemplos cargados de {dataset_key}")
+                
+        except Exception as e:
+            if is_main_process():
+                print(f"Error cargando {dataset_key}: {e}")
+    
+    if is_main_process():
+        print(f"Total de ejemplos de razonamiento: {len(all_examples)}")
+    
+    return ReasoningDataset(all_examples, tokenizer, max_length)
+
+
 def load_dolly_dataset(tokenizer, max_samples: int = None, max_length: int = 512):
-    dataset = load_dataset(DOLLY_DATASET, split="train")
+    """Legacy: Carga dataset Dolly. Usar load_reasoning_datasets() para mejor rendimiento."""
+    from datasets import load_dataset
+    dataset = load_dataset("databricks/databricks-dolly-15k", split="train")
     
     if max_samples:
         dataset = dataset.select(range(min(max_samples, len(dataset))))
@@ -96,17 +342,18 @@ def load_dolly_dataset(tokenizer, max_samples: int = None, max_length: int = 512
 
 
 def get_calibration_data(tokenizer, num_samples: int = CALIBRATION_SAMPLES) -> Tuple[torch.Tensor, torch.Tensor]:
-    dataset = load_dataset(DOLLY_DATASET, split="train")
+    """
+    Obtiene datos de calibración usando los datasets de razonamiento.
+    Útil para activaciones en O-Info pruning.
+    """
+    # Usar ARC Challenge para calibración (más relevante para benchmarks)
+    config = REASONING_DATASETS["arc"]
+    dataset = load_dataset(config["name"], config["subset"], split=config["split"])
     dataset = dataset.select(range(min(num_samples, len(dataset))))
     
     prompts = []
     for item in dataset:
-        instruction = item.get("instruction", "")
-        context = item.get("context", "")
-        if context:
-            prompt = f"### Instruction:\n{instruction}\n\n### Context:\n{context}\n\n### Response:\n"
-        else:
-            prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
+        prompt = _format_arc_example(item)
         prompts.append(prompt)
     
     encoded = tokenizer(
@@ -137,7 +384,23 @@ def fine_tune_lora(
     learning_rate: float = 2e-4,
     gradient_accumulation_steps: int = 4,
     max_samples: int = None,
+    use_reasoning_datasets: bool = True,
+    reasoning_datasets: List[str] = None,
 ):
+    """
+    Fine-tune con LoRA usando datasets de razonamiento.
+    
+    Args:
+        wrapper: QwenWrapper con el modelo
+        epochs: Número de epochs
+        batch_size: Tamaño de batch
+        learning_rate: Learning rate
+        gradient_accumulation_steps: Pasos de acumulación de gradiente
+        max_samples: Máximo de muestras totales (se divide entre datasets)
+        use_reasoning_datasets: Si True, usa datasets de razonamiento (ARC, HellaSwag, etc.)
+                               Si False, usa Dolly (legacy)
+        reasoning_datasets: Lista de datasets a usar (por defecto ACTIVE_REASONING_DATASETS)
+    """
     model = wrapper.model
     tokenizer = wrapper.tokenizer
     device = wrapper.device
@@ -149,7 +412,21 @@ def fine_tune_lora(
     peft_model = setup_lora(model)
     peft_model.train()
     
-    train_dataset = load_dolly_dataset(tokenizer, max_samples=max_samples)
+    # Usar datasets de razonamiento para mejor rendimiento en HellaSwag/ARC
+    if use_reasoning_datasets:
+        datasets_to_use = reasoning_datasets if reasoning_datasets else ACTIVE_REASONING_DATASETS
+        samples_per_dataset = max_samples // len(datasets_to_use) if max_samples else None
+        train_dataset = load_reasoning_datasets(
+            tokenizer, 
+            datasets_to_use=datasets_to_use,
+            max_samples_per_dataset=samples_per_dataset
+        )
+        if is_main_process():
+            print(f"Usando datasets de razonamiento: {datasets_to_use}")
+    else:
+        train_dataset = load_dolly_dataset(tokenizer, max_samples=max_samples)
+        if is_main_process():
+            print("Usando dataset Dolly (legacy)")
     
     if use_distributed:
         train_sampler = DistributedSampler(

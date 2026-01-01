@@ -45,7 +45,7 @@ def test_vit_accuracy():
     model_path = model_dir / "vit_mnist_pruned.pth"
     os.makedirs(model_dir, exist_ok=True)
     
-    train_loader, val_loader, test_loader = get_mnist_dataloaders(root=str(base_dir / "ViT_MNIST" / "data"))
+    train_loader, val_loader, test_loader, _ = get_mnist_dataloaders(root=str(base_dir / "ViT_MNIST" / "data"))
     
     if not model_path.exists():
         raise FileNotFoundError(

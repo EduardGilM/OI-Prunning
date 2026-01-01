@@ -105,7 +105,7 @@ def prune_vit_global():
     baseline_path = model_dir / "vit_mnist_base.pth"
     pruned_path = model_dir / "vit_mnist_pruned.pth"
     
-    _, val_loader, train_loader = get_mnist_dataloaders(
+    train_loader, val_loader, _, _ = get_mnist_dataloaders(
         root=str(base_dir / "ViT_MNIST" / "data"), batch_size=64
     )
 

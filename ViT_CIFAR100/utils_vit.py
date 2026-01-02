@@ -52,11 +52,9 @@ def get_cifar100_dataloaders(batch_size=32, root='.', use_distributed=None):
                                             generator=torch.Generator().manual_seed(RANDOM_SEED))
     
     if use_distributed:
-        train_loader, test_loader = setup_distributed_dataloaders(
-            train_subset, test_dataset, batch_size=batch_size
+        train_loader, val_loader, test_loader, _ = setup_distributed_dataloaders(
+            train_subset, val_subset, test_dataset, batch_size=batch_size
         )
-        # For validation in distributed, we can just use a subset or similar
-        val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
     else:
         train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=4)
         val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=4)
@@ -83,6 +81,19 @@ def evaluate(model, dataloader, criterion, device):
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
+    
+    # Synchronize results in distributed mode
+    import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized():
+        stats = torch.tensor([running_loss, correct, total], device=device)
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        running_loss, correct, total = stats.tolist()
+        # Adjust running_loss by world size for the average
+        num_batches = len(dataloader)
+        stats_batches = torch.tensor([float(num_batches)], device=device)
+        dist.all_reduce(stats_batches, op=dist.ReduceOp.SUM)
+        total_batches = stats_batches.item()
+        return running_loss / total_batches, correct / total
             
     return running_loss / len(dataloader), correct / total
 
@@ -91,9 +102,17 @@ def train_model(model, train_loader, val_loader, epochs, device, lr=2e-5):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
     for epoch in range(epochs):
+        # Set epoch for sampler if it exists
+        if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
+            
         model.train()
         running_loss = 0.0
-        for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+        
+        # Only show progress bar on main process
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}") if is_main_process() else train_loader
+        
+        for images, labels in pbar:
             images, labels = images.to(device), labels.to(device)
             
             optimizer.zero_grad()
@@ -107,4 +126,10 @@ def train_model(model, train_loader, val_loader, epochs, device, lr=2e-5):
             running_loss += loss.item()
             
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
-        print(f"Epoch {epoch+1} - Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        if is_main_process():
+            print(f"Epoch {epoch+1} - Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        
+        # Ensure all processes are synced before next epoch
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()

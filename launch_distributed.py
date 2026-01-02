@@ -21,14 +21,17 @@ def launch_distributed(script: str, script_args: list = None, num_gpus: int = No
         print("Only 1 GPU detected. Running single GPU training.")
         return subprocess.call([sys.executable, script] + script_args)
     
-    print(f"Detected {num_gpus} GPUs. Launching distributed training...")
+    print(f"Detected {num_gpus} GPUs. Launching distributed training via torchrun...")
+    
+    # Use a different port to avoid conflicts, or use environment variable if set
+    master_port = os.environ.get("MASTER_PORT", "29505")
     
     cmd = [
         sys.executable,
-        "-m", "torch.distributed.launch",
+        "-m", "torch.distributed.run",
         "--nproc_per_node", str(num_gpus),
         "--master_addr", "127.0.0.1",
-        "--master_port", "29500",
+        "--master_port", master_port,
         script
     ] + script_args
     

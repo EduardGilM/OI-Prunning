@@ -1,7 +1,6 @@
 .venv
 .env
 .pytest_cache
-models
 tests/__pycache__/
 *.pyc
 *.pyo
@@ -10,3 +9,4 @@ data
 utils/__pycache__/
 .agent
 DISTRIBUTED_TRAINING.md
+models

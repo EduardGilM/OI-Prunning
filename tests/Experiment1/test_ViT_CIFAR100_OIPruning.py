@@ -21,6 +21,7 @@ from ViT_CIFAR100.utils_vit import (
     NUM_CLASSES,
     IMG_SIZE,
 )
+from ViT_CIFAR100.download_hf_model import download_from_hf
 from utils.oinfo import calculate_oinfo_gradient, calculate_oinfo_gradient_distributed
 from utils.distributed import (
     init_distributed_mode,
@@ -153,6 +154,19 @@ def prune_vit_cifar100():
     
     model_path = model_dir / "pytorch_model.bin"
     pruned_path = model_dir / "pytorch_model_pruned.bin"
+    
+    if not model_path.exists() and is_main_process():
+        print(f"Modelo no encontrado en {model_path}")
+        repo_id = os.environ.get("HF_REPO_ID")
+        if repo_id:
+            print(f"Intentando descargar desde Hugging Face: {repo_id}")
+            download_from_hf(repo_id)
+        else:
+            print("Error: El modelo no existe y no se ha definido HF_REPO_ID en las variables de entorno.")
+            print("Usa: export HF_REPO_ID='tu_usuario/tu_repo' antes de ejecutar.")
+            sys.exit(1)
+    
+    synchronize_between_processes()
     
     train_loader, val_loader, _, _ = get_cifar100_dataloaders(
         root=str(base_dir / "ViT_CIFAR100" / "data"), batch_size=32

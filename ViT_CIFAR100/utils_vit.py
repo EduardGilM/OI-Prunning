@@ -45,20 +45,16 @@ def get_cifar100_dataloaders(batch_size=32, root='.', use_distributed=None):
     train_dataset = CIFAR100(root=root, train=True, download=True, transform=transform)
     test_dataset = CIFAR100(root=root, train=False, download=True, transform=transform)
     
-    # Split train into train and val (90/10)
-    train_size = int(0.9 * len(train_dataset))
-    val_size = len(train_dataset) - train_size
-    train_subset, val_subset = random_split(train_dataset, [train_size, val_size], 
-                                            generator=torch.Generator().manual_seed(RANDOM_SEED))
-    
     if use_distributed:
         train_loader, val_loader, test_loader, _ = setup_distributed_dataloaders(
-            train_subset, val_subset, test_dataset, batch_size=batch_size
+            train_dataset, test_dataset, test_dataset, batch_size=batch_size
         )
     else:
-        train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=4)
-        val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=4)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+        val_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+        
+    return train_loader, val_loader, test_loader, None
         
     return train_loader, val_loader, test_loader, None
 

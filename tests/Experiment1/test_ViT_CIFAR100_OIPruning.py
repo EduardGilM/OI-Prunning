@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from tqdm import tqdm
 from transformers import ViTForImageClassification
+import torch.distributed as dist
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -28,7 +29,8 @@ from utils.distributed import (
     wrap_model_distributed,
     is_main_process,
     synchronize_between_processes,
-    unwrap_model
+    unwrap_model,
+    is_distributed
 )
 
 
@@ -51,7 +53,9 @@ def get_layerwise_activations(model, val_loader, device, max_samples=500):
         return hook
 
     # Registrar hooks en las capas intermediate.dense
-    for i, layer in enumerate(model.vit.encoder.layer):
+    # Usamos unwrap_model para acceder a los atributos originales si es DDP
+    raw_model = unwrap_model(model)
+    for i, layer in enumerate(raw_model.vit.encoder.layer):
         name = f"encoder_{i}"
         hooks.append(layer.intermediate.dense.register_forward_hook(get_hook(name)))
 
@@ -77,7 +81,28 @@ def get_layerwise_activations(model, val_loader, device, max_samples=500):
 
     layer_tensors = {}
     for name, act_list in accumulated.items():
-        layer_tensors[name] = torch.cat(act_list, dim=0)[:max_samples]
+        local_act = torch.cat(act_list, dim=0)
+        
+        if is_distributed():
+            # Sincronizar activaciones para que todos los ranks tengan las mismas
+            # Truncamos/Paddeamos a max_samples para tener formas consistentes
+            if local_act.size(0) < max_samples:
+                padding = torch.zeros((max_samples - local_act.size(0), local_act.size(1)), device=local_act.device)
+                local_act = torch.cat([local_act, padding], dim=0)
+            else:
+                local_act = local_act[:max_samples]
+            
+            local_act = local_act.to(device)
+            world_size = dist.get_world_size()
+            gathered = [torch.zeros_like(local_act) for _ in range(world_size)]
+            dist.all_gather(gathered, local_act)
+            
+            # Combinamos y nos quedamos con max_samples (o lo que queramos)
+            # Aquí combinamos todos para tener más datos si es posible
+            combined = torch.cat(gathered, dim=0)
+            layer_tensors[name] = combined.cpu()
+        else:
+            layer_tensors[name] = local_act[:max_samples]
 
     sorted_keys = sorted(layer_tensors.keys(), key=lambda x: int(x.split('_')[-1]))
     layer_activations = []

@@ -94,7 +94,7 @@ def prune_vit_global():
     print("=" * 60)
     
     device = get_device()
-    base_dir = Path(__file__).parent.parent
+    base_dir = Path(__file__).parent.parent.parent
     plot_dir = base_dir / "plots" / "oinfo_vit"
     output_dir = base_dir / "plots" / "oi_pruning_vit"
     model_dir = base_dir / "ViT_MNIST" / "models"

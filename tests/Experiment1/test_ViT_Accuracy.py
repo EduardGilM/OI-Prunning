@@ -40,7 +40,7 @@ def test_vit_accuracy():
     print(f"Device: {device}")
     
     # Check for pruned model
-    base_dir = Path(__file__).parent.parent
+    base_dir = Path(__file__).parent.parent.parent
     model_dir = base_dir / "ViT_MNIST" / "models"
     model_path = model_dir / "vit_mnist_pruned.pth"
     os.makedirs(model_dir, exist_ok=True)

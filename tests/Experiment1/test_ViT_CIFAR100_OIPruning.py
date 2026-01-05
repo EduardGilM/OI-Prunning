@@ -8,8 +8,11 @@ import os
 import sys
 from pathlib import Path
 from tqdm import tqdm
-from transformers import ViTForImageClassification
+from transformers import ViTForImageClassification, logging as transformers_logging
 import torch.distributed as dist
+
+# Silenciar avisos de inicialización de transformers
+transformers_logging.set_verbosity_error()
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))

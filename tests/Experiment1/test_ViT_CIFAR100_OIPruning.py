@@ -130,14 +130,29 @@ def visualize_epoch_oinfo(layer_grads_list, iteration, output_dir):
         plt.savefig(iter_dir / f"{name}_gradients.png")
         plt.close()
 
-def prune_transformers_model(model, layer_keep_masks):
+def prune_transformers_model(model, layer_keep_masks, allow_layer_removal=True):
     """
     Modifica el modelo in-place reemplazando las capas Linear por versiones reducidas.
+    Si allow_layer_removal es True y una capa se queda sin neuronas, se elimina el bloque.
     """
+    raw_model = unwrap_model(model)
+    layers_to_keep = []
+    
     for i, mask in enumerate(layer_keep_masks):
-        layer = model.vit.encoder.layer[i]
+        layer = raw_model.vit.encoder.layer[i]
         indices = np.where(mask)[0]
         
+        if len(indices) == 0:
+            if allow_layer_removal:
+                if is_main_process():
+                    print(f"Removing layer {i} entirely as it has no active neurons.")
+                continue
+            else:
+                # Fallback: keep at least one neuron if removal is not allowed
+                if is_main_process():
+                    print(f"Layer {i} has no neurons but removal is disabled. Keeping 1 neuron.")
+                indices = np.array([0]) 
+
         old_inter = layer.intermediate.dense
         old_out = layer.output.dense
         
@@ -156,7 +171,9 @@ def prune_transformers_model(model, layer_keep_masks):
         # Reemplazar
         layer.intermediate.dense = new_inter
         layer.output.dense = new_out
+        layers_to_keep.append(layer)
         
+    raw_model.vit.encoder.layer = nn.ModuleList(layers_to_keep)
     return model
 
 def prune_vit_cifar100():
@@ -297,16 +314,16 @@ def prune_vit_cifar100():
             break
             
         layer_keep_masks = []
+        PRUNING_THRESHOLD = 0 # Umbral para considerar redundancia
         
         for (name, grads), stds in zip(layer_grads_list, layer_stds_list):
             is_active = stds > 1e-6
-            is_redundant = grads > 0
+            is_redundant = grads > PRUNING_THRESHOLD
             keep_mask = is_active & (~is_redundant)
             
             if np.sum(keep_mask) == 0:
                 if is_main_process():
-                    print(f"Warning: Layer {name} would be empty. Keeping 1 neuron.")
-                keep_mask[np.argmax(stds)] = True
+                    print(f"Warning: Layer {name} would be empty.")
                 
             layer_keep_masks.append(keep_mask)
             if is_main_process():
@@ -317,15 +334,15 @@ def prune_vit_cifar100():
         
         # Unwrap to modify architecture
         raw_model = unwrap_model(current_model)
-        current_model = prune_transformers_model(raw_model, layer_keep_masks)
+        current_model = prune_transformers_model(raw_model, layer_keep_masks, allow_layer_removal=True)
         
         # Re-wrap for DDP
         current_model = wrap_model_distributed(current_model)
         
         if is_main_process():
-            print("Fine-tuning (1 epoch)...")
+            print("Fine-tuning (5 epochs)...")
         
-        train_model(current_model, train_loader, val_loader, epochs=1, device=device, lr=1e-5)
+        train_model(current_model, train_loader, val_loader, epochs=5, device=device, lr=1e-5)
         
         _, acc = evaluate(current_model, val_loader, criterion, device)
         params = sum(p.numel() for p in current_model.parameters())

@@ -318,7 +318,7 @@ def prune_vit_cifar100():
 
         # get_layerwise_activations uses hooks, should work with DDP model
         layer_activations = get_layerwise_activations(
-            current_model, val_loader, device, max_samples=1000
+            current_model, val_loader, device, max_samples=500
         )
 
         layer_grads_list = []
